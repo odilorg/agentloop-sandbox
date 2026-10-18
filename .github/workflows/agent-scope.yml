@@ -1,0 +1,154 @@
+# Trusted scope check for agent PRs.
+#
+# Safety properties:
+# - pull_request_target: the workflow definition always comes from `main`, never from the PR.
+# - It NEVER checks out or executes PR code. It reads metadata through the GitHub REST API only.
+# - Read-only token. No secrets are used.
+# - No `paths:` filter, and `[skip ci]` does not apply to pull_request_target, so it runs on every
+#   PR update. A missing, failed or pending required check blocks merge.
+# - Untrusted data (file names, statuses, counts) stays structured JSON inside one Python program.
+#   It is never split by delimiters, never interpolated into shell or `${{ }}`, and is printed only
+#   JSON-escaped on prefixed lines, so it cannot form a workflow command or break the summary.
+# - Fails closed: any API error, unexpected field, type or value exits non-zero.
+# It blocks MERGE. It cannot prevent a write that already happened on a branch.
+name: agent-scope
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: agent-scope-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  agent-scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check changed files through the API (no checkout)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.request
+
+          API = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          REPO = os.environ["GITHUB_REPOSITORY"]
+          PR = os.environ["PR_NUMBER"]
+          EVENT_SHA = os.environ["EVENT_HEAD_SHA"]
+          TOKEN = os.environ["GH_TOKEN"]
+          SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          # Must stay identical to "Allowed paths" in docs/specs/001-pilot.md.
+          ALLOWED = re.compile(r"docs/pilot/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\.md")
+          STATUSES = {"added", "modified"}
+          MAX_FILES = 20
+          MAX_CHANGES = 200
+          SHA = re.compile(r"[0-9a-f]{40}")
+
+          problems = []
+
+          def out(line):
+              # Every line starts with "agent-scope:", so no line can start a workflow command.
+              print("agent-scope: " + line)
+              if SUMMARY:
+                  with open(SUMMARY, "a", encoding="utf-8") as f:
+                      f.write("- " + line.replace("<", "&lt;") + "\n")
+
+          def bad(msg, value=None):
+              problems.append(msg)
+              out("FAIL " + msg + ("" if value is None else " " + json.dumps(value)))
+
+          def get(path):
+              req = urllib.request.Request(API + path, headers={
+                  "Authorization": "Bearer " + TOKEN,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  link = r.headers.get("Link") or ""
+                  return json.load(r), link
+
+          def live_pr():
+              pr, _ = get(f"/repos/{REPO}/pulls/{PR}")
+              head = pr["head"]
+              return head["sha"], head["repo"]["full_name"] if head.get("repo") else None, pr["changed_files"], pr["state"]
+
+          def main():
+              if not re.fullmatch(r"[1-9][0-9]{0,6}", PR) or not SHA.fullmatch(EVENT_SHA):
+                  return bad("unexpected event data")
+
+              head_before, head_repo, changed_files, state = live_pr()
+              if head_repo != REPO:
+                  bad("PR comes from a fork; agent PRs must come from this repository")
+              if state != "open":
+                  bad("PR is not open")
+              if head_before != EVENT_SHA:
+                  return bad("PR head moved since the triggering event; a newer run will check it")
+              if type(changed_files) is not int or not 1 <= changed_files <= MAX_FILES:
+                  return bad(f"changed_files must be 1..{MAX_FILES}", changed_files)
+
+              files, link = get(f"/repos/{REPO}/pulls/{PR}/files?per_page=100")
+              if 'rel="next"' in link or not isinstance(files, list) or len(files) != changed_files:
+                  return bad("file list incomplete or does not match changed_files",
+                             {"listed": len(files) if isinstance(files, list) else None, "changed_files": changed_files})
+
+              total = 0
+              for i, f in enumerate(files):
+                  if not isinstance(f, dict):
+                      bad(f"file #{i}: not an object"); continue
+                  name, status, patch, changes = f.get("filename"), f.get("status"), f.get("patch"), f.get("changes")
+                  if type(name) is not str or any(ord(c) < 32 or ord(c) == 127 for c in name):
+                      bad(f"file #{i}: missing name or control characters in name", name); continue
+                  if ".." in name.split("/") or not ALLOWED.fullmatch(name):
+                      bad(f"file #{i}: outside allowed paths", name)
+                  if status not in STATUSES:
+                      bad(f"file #{i}: status not allowed (only added/modified)", status)
+                  if "previous_filename" in f:
+                      bad(f"file #{i}: renames are not allowed", f.get("previous_filename"))
+                  if type(patch) is not str or patch == "":
+                      bad(f"file #{i}: no textual patch (binary, empty or too large)", name)
+                  if type(changes) is not int or changes < 0:
+                      bad(f"file #{i}: unreadable change count", changes)
+                  else:
+                      total += changes
+              if total > MAX_CHANGES:
+                  bad(f"too many changed lines: {total} > {MAX_CHANGES}")
+
+              commit, _ = get(f"/repos/{REPO}/git/commits/{EVENT_SHA}")
+              tree_sha = commit["tree"]["sha"]
+              if not SHA.fullmatch(tree_sha or ""):
+                  return bad("unexpected tree SHA")
+              tree, _ = get(f"/repos/{REPO}/git/trees/{tree_sha}?recursive=1")
+              if tree.get("truncated") is not False:
+                  bad("tree listing truncated or missing; cannot verify")
+              blobs = {}
+              for e in tree.get("tree", []):
+                  p, mode = e.get("path"), e.get("mode")
+                  if mode in ("120000", "160000") or p == ".gitmodules" or (type(p) is str and p.endswith("/.gitmodules")):
+                      bad("forbidden entry in tree (symlink, submodule or .gitmodules)", {"mode": mode, "path": p})
+                  blobs[p] = mode
+              for f in files:
+                  if isinstance(f, dict) and f.get("status") in STATUSES and blobs.get(f.get("filename")) != "100644":
+                      bad("changed file is not a regular file at the head commit", f.get("filename"))
+
+              head_after, _, _, _ = live_pr()
+              if head_after != EVENT_SHA:
+                  bad("PR head moved while checking; result discarded")
+
+          try:
+              main()
+          except Exception as e:  # fail closed on anything unexpected, without echoing raw data
+              bad("check could not complete: " + type(e).__name__)
+
+          if problems:
+              sys.exit(1)
+          out(f"PASS {PR}: all changed files are added/modified Markdown under docs/pilot/")
+          PY
