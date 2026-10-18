@@ -6,3 +6,7 @@ edit in response to a reviewer's request.
 ## Corrections log
 
 Each applied correction appends a section below this line.
+
+## Test correction (ruleset verification)
+
+Synthetic line added by the ruleset verification test.
