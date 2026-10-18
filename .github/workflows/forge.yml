@@ -1,0 +1,9 @@
+# Test only: tries to satisfy the required "agent-scope" check from PR code.
+name: forge
+on: pull_request
+permissions: {}
+jobs:
+  agent-scope:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "forged pass"
