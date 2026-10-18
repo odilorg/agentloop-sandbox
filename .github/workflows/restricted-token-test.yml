@@ -1,0 +1,43 @@
+# Sandbox test only. Exercises the branch rulesets with the workflow's GITHUB_TOKEN,
+# a genuinely restricted, non-bypass identity (github-actions[bot]). Every step that
+# must be rejected fails this job if it succeeds.
+name: restricted-token-test
+on: pull_request
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  restricted-token-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      R: ${{ github.repository }}
+    steps:
+      - name: Run the permission matrix
+        run: |
+          set -u
+          T=$(date +%H%M%S)
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone -q "https://x-access-token:${GH_TOKEN}@github.com/$R.git" repo && cd repo
+          bad=0
+          must_fail(){ if "$@" >/tmp/o 2>&1; then echo "UNEXPECTED SUCCESS: $*"; bad=1; else echo "blocked as expected: $* :: $(grep -m1 -oE 'GH0[0-9]+[^.]*|refusing[^.]*|HTTP [0-9]+|declined[^)]*' /tmp/o)"; fi; }
+          must_pass(){ if "$@" >/tmp/o 2>&1; then echo "allowed as expected: $*"; else echo "UNEXPECTED FAILURE: $*"; cat /tmp/o; bad=1; fi; }
+          echo "identity: $(gh api /installation/repositories --jq '[.repositories[].full_name]|join(",")' 2>&1)"
+          git switch -q -c "agent/gh-token-$T" origin/main
+          printf '\nToken test %s.\n' "$T" >> docs/pilot/sandbox.md
+          git commit -qam "docs(pilot): token test $T"
+          must_pass git push -q origin "agent/gh-token-$T"
+          echo "pushed by: $(gh api repos/$R/commits/agent/gh-token-$T --jq '.committer.login // .commit.committer.name')"
+          must_fail git push -q origin "HEAD:refs/heads/main"
+          must_fail git push -q --force origin "origin/main:refs/heads/agent/gh-token-$T"
+          must_fail git push -q origin ":refs/heads/agent/gh-token-$T"
+          must_fail git push -q origin "origin/main:refs/heads/other-$T"
+          mkdir -p .github/workflows && printf 'name: x\non: workflow_dispatch\njobs: {}\n' > .github/workflows/x.yml
+          git add .github/workflows/x.yml && git commit -qm "test: workflow change"
+          must_fail git push -q origin "HEAD:refs/heads/agent/gh-token-$T"
+          must_fail gh api -X PUT "repos/$R/pulls/1/merge" -f merge_method=merge
+          must_fail gh api -X POST "repos/$R/pulls/1/reviews" -f event=APPROVE -f body="token test"
+          echo "main head: $(git ls-remote origin refs/heads/main | cut -c1-12)"
+          exit $bad
