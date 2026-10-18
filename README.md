@@ -29,3 +29,5 @@ design is tracked privately.
 | Disable the ChatGPT Work task | New reviews and fix requests |
 | Remove the machine account's access | Only actions taken **as the machine account**. It does **not** stop a Routine that acts through the owner's own GitHub connection; use the first two switches for that |
 | Archive the repo | All writes |
+
+Synthetic forbidden edit.
