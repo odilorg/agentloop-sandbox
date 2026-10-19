@@ -34,7 +34,7 @@ CLAUDE="$(readlink -f "$(sudo -u "$OWNER" bash -lc 'command -v claude')")"
 install -m 755 -o root -g root "$CLAUDE" /opt/agentloop/bin/claude
 install -d -m 700 -o root -g root /etc/agentloop
 # Inbox: the owner writes start.json / STOP here; the service can only read it.
-install -d -m 750 -o "$OWNER" -g agentloop /var/lib/agentloop-inbox
+install -d -m 2750 -o "$OWNER" -g agentloop /var/lib/agentloop-inbox   # setgid: new files get group agentloop
 install -m 644 "$SRC/agentloop@.service" "$SRC/agentloop.timer" /etc/systemd/system/
 systemctl daemon-reload
 echo "installed: user agentloop, /opt/agentloop (claude $(/opt/agentloop/bin/claude --version 2>/dev/null | cut -d' ' -f1)), units; timer NOT enabled"

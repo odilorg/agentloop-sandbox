@@ -285,5 +285,172 @@ class RunLoop(unittest.TestCase):
         self.assertEqual(self.applied_calls, [])
 
 
+FAKE_TOKEN = "sk-ant-oat01-" + "Q" * 40
+ERR_TEXT = "OAuth token has expired. Please obtain a new token " + FAKE_TOKEN
+
+
+def fake_claude(tmp, stream, stderr="", exit_code=0):
+    """Write a stand-in Claude binary: prints `stream` (list of dicts / raw strings), records its argv."""
+    lines = [json.dumps(x) if isinstance(x, dict) else x for x in stream]
+    script = Path(tmp) / "fake-claude"
+    argv_file = Path(tmp) / "argv.json"
+    script.write_text(f"""#!/usr/bin/env python3
+import json, sys
+if sys.argv[1:] == ["--version"]:
+    print("2.1.303 (Claude Code)"); sys.exit(0)
+open({str(argv_file)!r}, "w").write(json.dumps(sys.argv[1:]))
+sys.stdout.write({chr(10).join(lines)!r} + chr(10))
+sys.stderr.write({stderr!r})
+sys.exit({exit_code})
+""")
+    script.chmod(0o755)
+    return str(script), argv_file
+
+
+INIT = {"type": "system", "subtype": "init", "apiKeySource": "none", "claude_code_version": "2.1.303"}
+RATE_OK = {"type": "rate_limit_event", "rate_limit_info": {"isUsingOverage": False, "overageStatus": "rejected"}}
+CONTRADICTORY = {"type": "result", "subtype": "success", "is_error": True, "result": ERR_TEXT}
+GOOD = {"type": "result", "subtype": "success", "is_error": False, "result": "done"}
+
+
+class Diagnostics(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.c = config(self.tmp, claude_edit_globs=["docs/pilot/**"])
+        (self.c["workdir"] / "repo").mkdir(parents=True)
+
+    def logged(self, fn, *a):
+        out = []
+        with mock.patch("builtins.print", lambda *x, **k: out.append(" ".join(map(str, x)))):
+            try:
+                result = fn(*a)
+            except al.Fatal as e:
+                result = e
+        text = "\n".join(out) + (self.c["log_dir"] / "log.jsonl").read_text() if (self.c["log_dir"] / "log.jsonl").exists() else "\n".join(out)
+        return result, text
+
+    def assert_clean(self, text):
+        for leak in (FAKE_TOKEN, "sk-ant-", "QQQQ", "OAuth token has expired", "Please obtain", "Unauthorized",
+                     "You are applying"):
+            self.assertNotIn(leak, text)
+
+    def test_contradictory_success_is_error_exit1(self):
+        self.c["claude_bin"], _ = fake_claude(self.tmp, [INIT, CONTRADICTORY], stderr="Error: 401 Unauthorized", exit_code=1)
+        info = al.run_claude(self.c, "req", FAKE_TOKEN)
+        self.assertEqual((info["result"], info["is_error"], info["exit"]), ("success", True, 1))
+        self.assertTrue(al.run_failed(info))
+        self.assertEqual(info["diagnostic"], ["oauth_expired", "http_401"])
+        self.assertEqual(info["cli_version"], "2.1.303")
+        self.assertEqual(info["events"], {"system:init": 1, "result:success": 1})
+        self.assert_clean(json.dumps(info))
+
+    def test_failure_rejected_in_every_form(self):
+        base = {"exit": 0, "is_error": False, "result": "success"}
+        self.assertFalse(al.run_failed(base))
+        for bad in ({"exit": 1}, {"is_error": True}, {"is_error": None}, {"result": "error_max_turns"}, {"result": None}):
+            self.assertTrue(al.run_failed({**base, **bad}), bad)
+
+    def test_claude_step_logs_no_secrets_and_halts_without_usage(self):
+        self.c["claude_bin"], _ = fake_claude(self.tmp, [INIT, CONTRADICTORY, "non-json " + FAKE_TOKEN],
+                                              stderr="401 Unauthorized " + FAKE_TOKEN, exit_code=1)
+        result, text = self.logged(al.claude_step, self.c, "secret request text You are applying", FAKE_TOKEN)
+        self.assertIsInstance(result, al.Fatal)
+        self.assertTrue((self.c["state_dir"] / "HALT").exists())
+        self.assertIn('"is_error": true', text)
+        self.assertIn('"diagnostic": ["oauth_expired", "http_401"]', text)
+        self.assert_clean(text)
+
+    def test_existing_halt_never_overwritten(self):
+        (self.c["state_dir"] / "HALT").write_text("original reason")
+        with self.assertRaises(al.Fatal):
+            al.check_usage(self.c, {"apiKeySource": "none", "isUsingOverage": None, "overageStatus": None})
+        self.assertEqual((self.c["state_dir"] / "HALT").read_text(), "original reason")
+
+    def test_no_writes_on_failure(self):
+        calls = []
+        info = {"exit": 1, "is_error": True, "result": "success", "diagnostic": ["oauth_invalid"],
+                "apiKeySource": "none", "isUsingOverage": False, "overageStatus": "rejected"}
+        with mock.patch.object(al, "prepare_clone", return_value=SHA), \
+             mock.patch.object(al, "claude_step", return_value=(info, None)), \
+             mock.patch.object(al, "validate", lambda *a, **k: calls.append("validate")), \
+             mock.patch.object(al, "git", lambda *a, **k: calls.append(("git",) + a[2:])), \
+             mock.patch.object(al, "api_ok", lambda *a, **k: calls.append("api")):
+            sha, why = al.apply_request(self.c, {"token": "t"}, "agent/x", SHA, "1", 1, "req", FAKE_TOKEN)
+        self.assertIsNone(sha)
+        self.assertIn("oauth_invalid", why)
+        self.assertEqual(calls, [])                                         # no validate, commit, push or API write
+
+    def test_classify(self):
+        cases = {"Invalid bearer token": "oauth_invalid", "OAuth token has expired": "oauth_expired",
+                 "HTTP 403 Forbidden": "http_403", "429 Too Many Requests": "http_429",
+                 "EACCES: permission denied, mkdir": "fs_eacces", "error: unknown option '--foo'": "unsupported_flag",
+                 "getaddrinfo ENOTFOUND api.anthropic.com": "network", "Credit balance is too low": "credits",
+                 "something odd": "unknown", "": "no_error_text"}
+        for text, cat in cases.items():
+            self.assertIn(cat, al.classify(text), text)
+
+
+class Probe(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.c = config(self.tmp)
+        self.c["inbox"].mkdir()
+        (self.c["state_dir"] / "HALT").write_text("phase 2 halt")
+        self.rt = Path(self.tmp) / "run"
+        self.rt.mkdir()
+
+    def run_probe(self, stream, exit_code=0, trigger=al.PROBE_PHRASE):
+        self.c["claude_bin"], self.argv = fake_claude(self.tmp, stream, exit_code=exit_code)
+        if trigger is not None:
+            (self.c["inbox"] / "probe-request").write_text(trigger + "\n")
+        (self.rt / "claude-token").write_text(FAKE_TOKEN)
+        boom = mock.Mock(side_effect=AssertionError("probe must not call GitHub or git"))
+        out = []
+        with mock.patch.object(al, "RUNTIME", self.rt), mock.patch.object(al, "api", boom), \
+             mock.patch.object(al, "api_ok", boom), mock.patch.object(al, "git", boom), \
+             mock.patch("builtins.print", lambda *x, **k: out.append(" ".join(map(str, x)))):
+            try:
+                rc = al.cmd_probe(self.c)
+            except al.Fatal as e:
+                rc = e
+        return rc, "\n".join(out)
+
+    def test_requires_owner_trigger(self):
+        rc, _ = self.run_probe([INIT, RATE_OK, GOOD], trigger=None)
+        self.assertIsInstance(rc, al.Fatal)
+        rc, _ = self.run_probe([INIT, RATE_OK, GOOD], trigger="yes")
+        self.assertIsInstance(rc, al.Fatal)
+        self.assertFalse((self.c["state_dir"] / "probe-done").exists())
+
+    def test_success_once_only_read_only(self):
+        rc, text = self.run_probe([INIT, RATE_OK, GOOD])
+        self.assertEqual(rc, 0)
+        self.assertIn('"usage_confirmed": true', text)
+        argv = json.loads(self.argv.read_text())
+        self.assertEqual(argv[argv.index("--tools") + 1], "")               # no tools at all
+        self.assertNotIn("--allowedTools", argv)
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "1")
+        self.assertFalse((self.rt / "claude-token").exists())               # handoff consumed
+        self.assertEqual((self.c["state_dir"] / "HALT").read_text(), "phase 2 halt")   # HALT untouched
+        rc, _ = self.run_probe([INIT, RATE_OK, GOOD])
+        self.assertIsInstance(rc, al.Fatal)                                 # once only
+
+    def test_failure_reports_categories_only(self):
+        rc, text = self.run_probe([INIT, CONTRADICTORY], exit_code=1)
+        self.assertEqual(rc, 1)
+        self.assertIn('"usage_confirmed": false', text)
+        self.assertIn("oauth_expired", text)
+        for leak in (FAKE_TOKEN, "sk-ant-", "Please obtain"):
+            self.assertNotIn(leak, text)
+        self.assertEqual((self.c["state_dir"] / "HALT").read_text(), "phase 2 halt")
+        self.assertTrue((self.c["state_dir"] / "probe-done").exists())      # a failed probe still counts
+
+    def test_counts_against_cap(self):
+        (self.c["state_dir"] / "usage.json").write_text(json.dumps(
+            {"day": al.datetime.datetime.now(al.datetime.timezone.utc).strftime("%Y-%m-%d"), "runs": 10}))
+        rc, _ = self.run_probe([INIT, RATE_OK, GOOD])
+        self.assertIsInstance(rc, al.Fatal)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

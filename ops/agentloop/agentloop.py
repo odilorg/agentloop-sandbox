@@ -19,6 +19,8 @@ Commands:
   whoami     show the identity checks
   selftest   GitHub permission matrix (selftest.py)
   isolation  negative secret-read and network tests of the sandbox itself (isolation.py)
+  probe      owner-started, once-only diagnostic: one tool-less `claude -p` in the same unit and
+             subscription environment; no repository, no GitHub; logs categories, never raw output
 
 Comment protocol (reviewer, ChatGPT Work via the chatgpt-codex-connector app, as the owner):
   AGENT-REVIEW v1
@@ -47,7 +49,7 @@ RUNTIME = Path(os.environ.get("RUNTIME_DIRECTORY", "/run/agentloop"))
 ALLOWED_APP_PERMS = {"contents": "write", "pull_requests": "write", "issues": "write", "metadata": "read"}
 TOKEN_PERMS = {"contents": "write", "pull_requests": "write", "issues": "write"}
 STOP_LABELS = {"agent-stop", "agent-needs-owner"}
-COMMANDS = ("run", "start", "whoami", "selftest", "isolation")
+COMMANDS = ("run", "start", "whoami", "selftest", "isolation", "probe")
 SECRET_PATTERNS = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"
                              r"|\bsk-ant-[A-Za-z0-9_-]{10,}|\bAKIA[0-9A-Z]{16}\b")
 
@@ -158,6 +160,11 @@ def cmd_mint(c, command):
     st = RUNTIME.stat()
     if os.geteuid() != 0 or st.st_uid == 0:
         raise Fatal("mint must run as root into the unit's runtime directory")
+    if command == "probe":                                     # no GitHub access at all: no App token is minted
+        tf = Path(c["claude_token_file"])
+        if tf.exists():
+            write_handoff(RUNTIME / "claude-token", tf.read_text().strip(), st.st_uid, st.st_gid)
+        return 0
     jwt = app_jwt(c)
     _, app, _ = api("GET", "/app", jwt)
     if not app or app.get("slug") != c["app_slug"] or app.get("id") != c["app_id"]:
@@ -253,10 +260,11 @@ def prepare_clone(c, ident, branch, sha=None):
 
 
 # ── usage guard (subscription only, daily cap, fail closed) ──────────────────
-def usage_gate(c):
-    """Count one Claude run against today's cap. Returns a reason string if the run must not happen."""
+def usage_gate(c, ignore_halt=False):
+    """Count one Claude run against today's cap. Returns a reason string if the run must not happen.
+    Only the owner-started probe passes ignore_halt; it still counts against the cap."""
     halt = c["state_dir"] / "HALT"
-    if halt.exists():
+    if halt.exists() and not ignore_halt:
         return f"halted: {halt.read_text().strip()[:200]} (owner deletes {halt} after checking)"
     f = c["state_dir"] / "usage.json"
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
@@ -272,8 +280,7 @@ def usage_gate(c):
     return None
 
 
-def check_usage(c, info):
-    """Subscription with no paid extra usage, confirmed by Claude's own stream; anything else halts the runner."""
+def usage_problems(info):
     problems = []
     if info["apiKeySource"] != "none":
         problems.append(f"apiKeySource={info['apiKeySource']}")
@@ -281,9 +288,105 @@ def check_usage(c, info):
         problems.append(f"isUsingOverage={info['isUsingOverage']}")
     if info["overageStatus"] != "rejected":
         problems.append(f"overageStatus={info['overageStatus']} (extra usage must be off)")
+    return problems
+
+
+def check_usage(c, info):
+    """Subscription with no paid extra usage, confirmed by Claude's own stream; anything else halts the runner.
+    An existing HALT file is never overwritten or removed here."""
+    problems = usage_problems(info)
     if problems:
-        (c["state_dir"] / "HALT").write_text("usage not confirmed subscription-only: " + ", ".join(problems))
+        halt = c["state_dir"] / "HALT"
+        if not halt.exists():
+            halt.write_text("usage not confirmed subscription-only: " + ", ".join(problems))
         raise Fatal("halting: " + ", ".join(problems))
+
+
+def run_failed(info):
+    """Any sign of failure rejects the output, whatever the subtype says (subtype=success + is_error=true + exit 1 happens)."""
+    return info["exit"] != 0 or info["is_error"] is not False or info["result"] != "success"
+
+
+# Fixed patterns, applied in memory to Claude's result text and stderr. Only the category NAMES are logged.
+DIAG_PATTERNS = [
+    ("oauth_expired", r"(oauth|token)[^\n]{0,40}expired|expired[^\n]{0,20}token"),
+    ("oauth_invalid", r"invalid[^\n]{0,20}(bearer|oauth|api key|token|x-api-key|credential)|authentication_error|"
+                      r"invalid authentication|please run /login|not logged in|login required"),
+    ("oauth_scope", r"scope|not (allowed|authorized) (for|to use)|does not have access|organization[^\n]{0,30}(disabled|not allowed)"),
+    ("http_401", r"\b401\b|unauthori[sz]ed"),
+    ("http_403", r"\b403\b|forbidden|permission_error"),
+    ("http_429", r"\b429\b|rate.?limit|usage limit|too many requests|overloaded"),
+    ("credits", r"credit balance|out of credits|extra usage|billing"),
+    ("fs_eacces", r"eacces|permission denied|read-only file system|erofs"),
+    ("unsupported_flag", r"unknown option|unrecognized|unexpected argument|invalid (option|value) for"),
+    ("network", r"enotfound|econnrefused|econnreset|etimedout|getaddrinfo|network error|connection error|socket hang up|fetch failed"),
+]
+
+
+def classify(*texts):
+    blob = "\n".join(t for t in texts if t).lower()
+    cats = [name for name, pat in DIAG_PATTERNS if re.search(pat, blob)]
+    return cats or (["unknown"] if blob.strip() else ["no_error_text"])
+
+
+def parse_stream(stdout, stderr, returncode):
+    """Reduce Claude's output to fixed, non-sensitive fields. Raw stdout/stderr and result text never leave here."""
+    info = {"exit": returncode, "cli_version": None, "apiKeySource": None, "result": None, "is_error": None,
+            "isUsingOverage": None, "overageStatus": None, "denials": None, "events": {}}
+    error_texts = [stderr]
+    for line in stdout.splitlines():
+        try:
+            d = json.loads(line)
+        except Exception:
+            info["events"]["non_json"] = info["events"].get("non_json", 0) + 1
+            error_texts.append(line)
+            continue
+        if not isinstance(d, dict):
+            continue
+        kind = re.sub(r"[^a-z_:]", "?", (str(d.get("type")) + (f":{d.get('subtype')}" if d.get("subtype") else ""))[:48])
+        info["events"][kind] = info["events"].get(kind, 0) + 1
+        if d.get("type") == "system" and d.get("subtype") == "init":
+            info["apiKeySource"] = d.get("apiKeySource")
+            info["cli_version"] = d.get("claude_code_version")
+        elif d.get("type") == "result":
+            info["result"] = d.get("subtype")
+            info["is_error"] = d.get("is_error")
+            info["denials"] = len(d.get("permission_denials") or [])
+            error_texts.append(str(d.get("result") or ""))
+            error_texts.extend(str(e) for e in (d.get("errors") or []))
+        elif d.get("type") == "rate_limit_event":
+            rl = d.get("rate_limit_info") or {}
+            info["isUsingOverage"] = rl.get("isUsingOverage")
+            info["overageStatus"] = rl.get("overageStatus")
+        elif d.get("type") == "assistant" and d.get("error"):
+            error_texts.append(str(d.get("error")))
+    info["diagnostic"] = classify(*error_texts) if run_failed(info) else ["none"]
+    return info
+
+
+def claude_env(c, home, claude_token):
+    return {"PATH": "/usr/bin:/bin", "HOME": str(home), "CLAUDE_CONFIG_DIR": str(home / ".claude"), "LANG": "C.UTF-8",
+            "CLAUDE_CODE_OAUTH_TOKEN": claude_token, "DISABLE_AUTOUPDATER": "1"}
+
+
+def fresh_home(c):
+    home = c["state_dir"] / "claude-home"                      # fresh per run: no memory carried between runs
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(mode=0o700)
+    mcp = home / "empty-mcp.json"
+    mcp.write_text('{"mcpServers":{}}')
+    return home, mcp
+
+
+def cli_version(c, home, claude_token):
+    """Local version string; no model call."""
+    try:
+        r = subprocess.run([c["claude_bin"], "--version"], env=claude_env(c, home, claude_token), capture_output=True,
+                           text=True, timeout=30, stdin=subprocess.DEVNULL)
+        m = re.match(r"\s*(\d+\.\d+\.\d+)", r.stdout)
+        return m.group(1) if m else None
+    except Exception:
+        return None
 
 
 # ── Claude (subscription only, inside the unit sandbox) ──────────────────────
@@ -300,34 +403,16 @@ def run_claude(c, request, claude_token):
         "is out of scope, unclear or unsafe, make no change at all.\n"
         "<<<REQUEST\n" + request + "\nREQUEST>>>")
     allowed = ["Read(./**)"] + [f"Edit(./{g})" for g in globs] + [f"Write(./{g})" for g in globs]
-    home = c["state_dir"] / "claude-home"                      # fresh per run: no memory carried between runs
-    shutil.rmtree(home, ignore_errors=True)
-    home.mkdir(mode=0o700)
-    mcp = home / "empty-mcp.json"
-    mcp.write_text('{"mcpServers":{}}')
-    env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "CLAUDE_CONFIG_DIR": str(home / ".claude"), "LANG": "C.UTF-8",
-           "CLAUDE_CODE_OAUTH_TOKEN": claude_token, "DISABLE_AUTOUPDATER": "1"}
+    home, mcp = fresh_home(c)
+    version = cli_version(c, home, claude_token)
     cmd = [c["claude_bin"], "-p", prompt, "--setting-sources", "", "--strict-mcp-config", "--mcp-config", str(mcp),
            "--tools", "Read,Edit,Write", "--allowedTools", *allowed, "--permission-mode", "default",
            "--max-turns", "10", "--no-session-persistence", "--output-format", "stream-json", "--verbose"]
-    r = subprocess.run(cmd, cwd=c["workdir"] / "repo", env=env, capture_output=True, text=True,
-                       timeout=600, stdin=subprocess.DEVNULL)
+    r = subprocess.run(cmd, cwd=c["workdir"] / "repo", env=claude_env(c, home, claude_token), capture_output=True,
+                       text=True, timeout=600, stdin=subprocess.DEVNULL)
     shutil.rmtree(home, ignore_errors=True)
-    info = {"exit": r.returncode, "apiKeySource": None, "result": None, "isUsingOverage": None, "overageStatus": None}
-    for line in r.stdout.splitlines():
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-        if d.get("type") == "system" and d.get("subtype") == "init":
-            info["apiKeySource"] = d.get("apiKeySource")
-        elif d.get("type") == "result":
-            info["result"] = d.get("subtype")
-            info["denials"] = len(d.get("permission_denials") or [])
-        elif d.get("type") == "rate_limit_event":
-            rl = d.get("rate_limit_info") or {}
-            info["isUsingOverage"] = rl.get("isUsingOverage")
-            info["overageStatus"] = rl.get("overageStatus")
+    info = parse_stream(r.stdout, r.stderr, r.returncode)
+    info["cli_version"] = info["cli_version"] or version
     return info
 
 
@@ -340,6 +425,43 @@ def claude_step(c, request, claude_token):
     log(c, "claude", **info)
     check_usage(c, info)
     return info, None
+
+
+PROBE_PHRASE = "run one agentloop diagnostic probe"
+
+
+def cmd_probe(c):
+    """Owner-started, once-only, read-only Claude call in the same unit and subscription environment.
+    No tools, no repository, no GitHub. Runs even while HALT exists (it never removes it)."""
+    trigger, done = c["inbox"] / "probe-request", c["state_dir"] / "probe-done"
+    if done.exists():
+        raise Fatal(f"probe already ran ({done.read_text().strip()}); the owner deletes {done} to allow another")
+    if not trigger.exists() or trigger.read_text().strip() != PROBE_PHRASE:
+        raise Fatal(f"owner trigger missing: write '{PROBE_PHRASE}' to {trigger}")
+    claude_token = take(RUNTIME / "claude-token")
+    if not claude_token:
+        raise Fatal("no Claude subscription token handed over; refusing (there is no fallback)")
+    why = usage_gate(c, ignore_halt=True)
+    if why:
+        raise Fatal(why)
+    done.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))  # once-only, even if the call fails
+    home, mcp = fresh_home(c)
+    version = cli_version(c, home, claude_token)
+    cmd = [c["claude_bin"], "-p", "Reply with the single word ok.", "--setting-sources", "", "--strict-mcp-config",
+           "--mcp-config", str(mcp), "--tools", "", "--permission-mode", "default", "--max-turns", "1",
+           "--no-session-persistence", "--output-format", "stream-json", "--verbose"]
+    r = subprocess.run(cmd, cwd=home, env=claude_env(c, home, claude_token), capture_output=True, text=True,
+                       timeout=300, stdin=subprocess.DEVNULL)
+    shutil.rmtree(home, ignore_errors=True)
+    info = parse_stream(r.stdout, r.stderr, r.returncode)
+    info["cli_version"] = info["cli_version"] or version
+    problems = usage_problems(info)
+    log(c, "probe", **info, usage_confirmed=not problems, usage_problems=problems)
+    if problems:
+        halt = c["state_dir"] / "HALT"
+        if not halt.exists():
+            halt.write_text("probe: usage not confirmed subscription-only: " + ", ".join(problems))
+    return 0 if not (problems or run_failed(info)) else 1
 
 
 # ── diff validation (the wrapper decides, not the model) ─────────────────────
@@ -444,8 +566,9 @@ def apply_request(c, ident, branch, head_sha, request_id, round_no, request_text
     info, why = claude_step(c, request_text, claude_token)
     if why:
         return "", why
-    if info["exit"] != 0 or info["result"] != "success":
-        return None, f"Claude run failed (exit {info['exit']}, {info['result']})"
+    if run_failed(info):
+        return None, (f"Claude run failed (exit {info['exit']}, is_error {info['is_error']}, "
+                      f"diagnostic {'/'.join(info['diagnostic'])})")
     paths, why = validate(c, ident, secrets=(ident["token"], claude_token))
     if why:
         return None, why
@@ -553,8 +676,9 @@ def cmd_start(c):
     info, why = claude_step(c, request, claude_token)
     if why:
         raise Fatal(why)
-    if info["exit"] != 0 or info["result"] != "success":
-        raise Fatal(f"Claude run not acceptable: {info}")
+    if run_failed(info):
+        raise Fatal(f"Claude run failed (exit {info['exit']}, is_error {info['is_error']}, "
+                    f"diagnostic {'/'.join(info['diagnostic'])})")
     paths, why = validate(c, ident, secrets=(ident["token"], claude_token))
     if why:
         raise Fatal(why)
@@ -607,6 +731,8 @@ def main():
             return cmd_start(c)
         if cmd == "whoami":
             return cmd_whoami(c)
+        if cmd == "probe":
+            return cmd_probe(c)
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         if cmd == "selftest":
             import selftest

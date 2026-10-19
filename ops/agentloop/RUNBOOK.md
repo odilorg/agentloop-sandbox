@@ -82,6 +82,23 @@ also checks this on every run and halts itself if Claude reports otherwise.
 Start a task as the agent: write `{"branch": "agent/<name>", "title": "...", "request": "..."}`
 to `/var/lib/agentloop-inbox/start.json`, then `sudo systemctl start agentloop@start`.
 
+## Diagnostic probe (owner only, once)
+
+`agentloop@probe` makes one tool-less `claude -p "Reply with the single word ok."` call in the
+same unit, user and subscription environment: no repository, no GitHub token (the mint stage
+hands over only the Claude token), no edits, no comments. It runs even while `HALT` exists and
+never removes it; it still counts against the daily cap. It logs only fixed fields: exit code,
+`is_error`, result subtype, CLI version, event-type counts, usage fields and a diagnostic
+category (`oauth_expired`, `oauth_invalid`, `oauth_scope`, `http_401/403/429`, `credits`,
+`fs_eacces`, `unsupported_flag`, `network`, `unknown`). Raw output, prompts and tokens are never logged.
+
+```
+echo 'run one agentloop diagnostic probe' > /var/lib/agentloop-inbox/probe-request
+sudo systemctl start agentloop@probe
+journalctl -u agentloop@probe -o cat | grep '"event": "probe"'
+```
+A second probe needs the owner to delete `/var/lib/agentloop/probe-done` first.
+
 ## Failures and stopping conditions
 
 | Situation | Behaviour |
@@ -92,6 +109,7 @@ to `/var/lib/agentloop-inbox/start.json`, then `sudo systemctl start agentloop@s
 | Same request again (rerun, crash after push) | skipped: `Agent-Request` trailer or an existing reply marks it handled |
 | 3 corrections applied on a PR | NEEDS_OWNER (round limit) |
 | Comment from another user, other app, edited, or not matching the schema | ignored (counted in the `idle` log line) |
+| Claude exit ≠ 0, `is_error` not false, or subtype ≠ success | output rejected before validate/commit/push; NEEDS_OWNER (`run`) or fatal (`start`) with the diagnostic category |
 | 10 Claude runs today | skipped until the next UTC day (`deferred`) |
 | Claude not on subscription, overage in use, extra usage on, or usage not reported | HALT file; nothing more runs until the owner deletes `/var/lib/agentloop/HALT` |
 | No Claude token | run fails closed; there is no fallback credential |
