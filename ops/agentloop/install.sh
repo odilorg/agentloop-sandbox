@@ -8,12 +8,33 @@ set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 OWNER="${SUDO_USER:?run through sudo from the owner account}"
 
+# A narrow terminal wraps the setup token; copying one screen line gave a 79-character token and an API 401.
+# Join every pasted line, and drain the rest of the paste so no part of it reaches the shell afterwards.
+read_token() {
+  local line="" t=""
+  IFS= read -rs line || true
+  t="$line"; line=""
+  while IFS= read -rs -t 1 line || [ -n "$line" ]; do t+="$line"; line=""; done
+  printf '%s' "$t"
+}
+
+# Floor, not an exact length: current tokens are about 108 characters, a truncated copy was 79.
+TOKEN_MIN_LEN=100
+token_ok() {
+  [[ "$1" =~ ^sk-ant-oat[0-9A-Za-z_-]+$ ]] && [ "${#1}" -ge "$TOKEN_MIN_LEN" ]
+}
+
 if [ "${1:-}" = "--claude-token" ]; then
   install -d -m 700 /etc/agentloop
-  read -rsp "Paste the token printed by 'claude setup-token' (input hidden): " t; echo
-  [[ "$t" =~ ^sk-ant-oat[0-9A-Za-z_-]+$ ]] || { echo "that does not look like a setup-token token"; exit 1; }
-  umask 077; printf '%s\n' "$t" > /etc/agentloop/claude-token; unset t
-  echo "stored /etc/agentloop/claude-token (root, 0600)"; exit 0
+  printf "Paste the FULL token printed by 'claude setup-token', all wrapped lines (input hidden), then Enter: "
+  t="$(read_token)"; echo
+  if ! token_ok "$t"; then
+    echo "rejected (${#t} characters): expected sk-ant-oat… with no spaces and at least $TOKEN_MIN_LEN characters;" \
+         "a short value is usually a copy of only the first wrapped line. Nothing was stored."
+    unset t; exit 1
+  fi
+  umask 077; printf '%s\n' "$t" > /etc/agentloop/claude-token
+  echo "stored /etc/agentloop/claude-token (root, 0600, ${#t} characters)"; unset t; exit 0
 fi
 
 if [ "${1:-}" = "--uninstall" ]; then

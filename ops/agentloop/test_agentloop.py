@@ -500,5 +500,42 @@ class Probe(unittest.TestCase):
         self.assertIsInstance(rc, al.Fatal)
 
 
+class InstallerToken(unittest.TestCase):
+    """install.sh --claude-token input handling, run through bash with only its two token functions."""
+    FULL = "sk-ant-oat01-" + "A1b2_C3d-" * 10 + "xyz01"     # 108 characters, fake
+
+    def check(self, pasted):
+        script = Path(__file__).with_name("install.sh")
+        funcs = (f'eval "$(sed -n -e \'/^read_token()/,/^}}/p\' -e \'/^TOKEN_MIN_LEN=/p\' -e \'/^token_ok()/,/^}}/p\' {script})"; '
+                 't="$(read_token)"; if token_ok "$t"; then echo "ok ${#t}"; else echo "bad ${#t}"; fi')
+        r = subprocess.run(["bash", "-c", funcs], input=pasted, capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.stderr, "")
+        return r.stdout.strip()
+
+    def test_full_length_accepted(self):
+        self.assertEqual(len(self.FULL), 108)
+        self.assertEqual(self.check(self.FULL + "\n"), "ok 108")
+
+    def test_truncated_79_rejected(self):
+        self.assertEqual(self.check(self.FULL[:79] + "\n"), "bad 79")
+
+    def test_wrapped_paste_joined(self):
+        self.assertEqual(self.check(self.FULL[:79] + "\n" + self.FULL[79:] + "\n"), "ok 108")
+        self.assertEqual(self.check(self.FULL[:79] + "\n" + self.FULL[79:]), "ok 108")   # no final newline
+
+    def test_malformed_rejected(self):
+        for bad in (self.FULL[:50] + " " + self.FULL[50:], self.FULL + "\nextra text", "sk-ant-api03-" + "x" * 100,
+                    "", self.FULL.replace("sk-ant-oat01-", "")):
+            self.assertTrue(self.check(bad + "\n").startswith("bad"), repr(bad[:20]))
+
+    def test_message_never_prints_token(self):
+        src = Path(__file__).with_name("install.sh").read_text()
+        block = src[src.index('if [ "${1:-}" = "--claude-token" ]'):src.index('if [ "${1:-}" = "--uninstall" ]')]
+        uses = re.findall(r"\$\{?#?t\b\}?", block)
+        self.assertEqual(sorted(set(uses)), ["$t", "${#t}"])                  # only the length is ever shown
+        self.assertEqual([l.strip() for l in block.splitlines() if re.search(r"\$t\b", l) and "#t" not in l],
+                         ['if ! token_ok "$t"; then', "umask 077; printf '%s\\n' \"$t\" > /etc/agentloop/claude-token"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

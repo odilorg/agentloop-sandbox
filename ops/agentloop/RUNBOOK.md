@@ -68,7 +68,8 @@ a whole-filesystem sweep for readable credential-like files). It never reads a p
 sudo ops/agentloop/install.sh                         # user, code, units; timer NOT enabled
 sudo python3 ops/agentloop/app_setup.py               # once: create + install the App (browser)
 claude setup-token                                    # in your own terminal, never in a chat
-sudo ops/agentloop/install.sh --claude-token          # paste it (hidden input)
+sudo ops/agentloop/install.sh --claude-token          # paste ALL of it (hidden input; wrapped lines are joined;
+                                                      # under 100 characters is rejected as a partial copy)
 sudo systemctl start agentloop@isolation              # sandbox proof
 sudo systemctl start agentloop@whoami                 # identity checks
 sudo systemctl start agentloop@selftest               # GitHub permission matrix
