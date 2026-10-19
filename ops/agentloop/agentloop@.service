@@ -1,0 +1,60 @@
+# agentloop@<command>.service — run, start, whoami, selftest, isolation. Sandbox pilot only.
+# Stage 1 (ExecStartPre, "+" = root, outside the sandbox) mints the App token; stage 2 runs as
+# the dedicated user agentloop inside the sandbox below and never sees the App key.
+[Unit]
+Description=agentloop %i (odilorg/agentloop-sandbox pilot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=agentloop
+Group=agentloop
+ExecStartPre=+/usr/bin/python3 -I /opt/agentloop/agentloop.py mint %i
+ExecStart=/usr/bin/python3 -I /opt/agentloop/agentloop.py %i
+TimeoutStartSec=900
+UMask=0077
+Environment=AGENTLOOP_CONFIG=/etc/agentloop.json
+RuntimeDirectory=agentloop
+RuntimeDirectoryMode=0700
+StateDirectory=agentloop
+StateDirectoryMode=0700
+LogsDirectory=agentloop
+LogsDirectoryMode=0755
+
+# Filesystem: everything read-only; homes, data, credentials, container and database paths hidden.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+# /var/lib is replaced by an empty read-only tmpfs; only the state directory and the inbox are mounted in.
+TemporaryFileSystem=/var/lib:ro
+BindReadOnlyPaths=/var/lib/agentloop-inbox
+InaccessiblePaths=/etc/agentloop -/boot -/data -/srv -/var/www -/mnt -/media -/run/docker.sock -/var/lib/docker -/var/lib/containerd -/run/containerd -/run/mysqld -/var/lib/mysql -/run/postgresql -/var/lib/postgresql -/var/lib/redis -/run/redis -/etc/mysql -/var/backups -/var/spool/cron -/etc/sudoers.d
+ProtectProc=invisible
+ProcSubset=pid
+
+# Network: Internet only. No localhost services (DNS stub excepted), no LAN, Tailscale or Docker networks,
+# no Unix sockets.
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53/32
+
+# Privileges and kernel surface.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+MemoryMax=4G
+TasksMax=256

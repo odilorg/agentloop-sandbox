@@ -1,40 +1,55 @@
 #!/usr/bin/env python3
-"""agentloop: apply ChatGPT Work review requests to agent/* pull requests.
+"""agentloop: apply ChatGPT Work review requests to agent/* pull requests. Sandbox pilot only.
 
-Runs on the owner's machine (systemd user timer). GitHub access is a GitHub App
-installation token minted per run, scoped to ONE repository and to contents,
-pull requests and issues only (no workflows, no administration). Claude Code runs
-on the owner's subscription login, with Read/Edit/Write on the allowed paths only
-and no shell. The wrapper, not the model, validates the diff, commits and pushes.
+Runs as the system unit agentloop@<command>.service under the dedicated user `agentloop`,
+inside a systemd sandbox that hides /home, /root, /data, /etc/agentloop, Docker and database
+sockets, and blocks localhost/LAN/Tailscale addresses (see agentloop@.service).
+
+Two stages per unit run:
+  mint (ExecStartPre, root)  reads the App key from /etc/agentloop, proves the App identity,
+                             mints a 1-hour token for the one sandbox repository and hands it,
+                             plus the Claude subscription token, to the unit's runtime directory.
+                             The App key never reaches the agentloop user.
+  <command> (agentloop user) reads both tokens into memory and deletes the files before any
+                             untrusted text is processed.
 
 Commands:
   run        one cycle: handle at most one review request, then exit
-  start      create a new agent/* branch from the default branch, apply a request
-             file and open a PR as the App
+  start      open a new agent/* PR from /var/lib/agentloop-inbox/start.json (once per file content)
   whoami     show the identity checks
+  selftest   GitHub permission matrix (selftest.py)
+  isolation  negative secret-read and network tests of the sandbox itself (isolation.py)
 
-Comment protocol (reviewer, ChatGPT Work via the chatgpt-codex-connector app):
+Comment protocol (reviewer, ChatGPT Work via the chatgpt-codex-connector app, as the owner):
   AGENT-REVIEW v1
   Commit: <40-hex PR head SHA>
-  Verdict: FIX | PASS
+  Verdict: FIX | PASS | ESCALATE
   Request:
-  <change requested>
+  <change requested, or the concern for ESCALATE>
 
 Reply (this runner, as the App):
   AGENT-REPLY v1 / Request: <comment id> / Status: APPLIED|NEEDS_OWNER / Commit: <sha>
 
-The token is kept in memory, handed to git only through an environment variable
-read by a credential helper, and never logged or written to disk.
+Tokens are kept in memory, handed to git only through an environment variable read by a
+credential helper, and never logged or written anywhere except the root-written runtime handoff.
 """
-import base64, fcntl, json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
+import base64, datetime, fcntl, hashlib, json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
 from pathlib import Path
 
-CONFIG = Path(os.environ.get("AGENTLOOP_CONFIG", "~/.config/agentloop/config.json")).expanduser()
+# The pilot is pinned: these are constants, not configuration.
 SANDBOX = "odilorg/agentloop-sandbox"
+OWNER_LOGIN, OWNER_ID = "odilorg", 20632218
+REVIEWER_APP = {"id": 1144995, "slug": "chatgpt-codex-connector", "owner": "openai"}
+MAX_RUNS_PER_DAY = 10
+
+CONFIG = Path(os.environ.get("AGENTLOOP_CONFIG", "/etc/agentloop.json"))
+RUNTIME = Path(os.environ.get("RUNTIME_DIRECTORY", "/run/agentloop"))
 ALLOWED_APP_PERMS = {"contents": "write", "pull_requests": "write", "issues": "write", "metadata": "read"}
 TOKEN_PERMS = {"contents": "write", "pull_requests": "write", "issues": "write"}
 STOP_LABELS = {"agent-stop", "agent-needs-owner"}
-SAFE_ENV = ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "SHELL")
+COMMANDS = ("run", "start", "whoami", "selftest", "isolation")
+SECRET_PATTERNS = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"
+                             r"|\bsk-ant-[A-Za-z0-9_-]{10,}|\bAKIA[0-9A-Z]{16}\b")
 
 
 class Fatal(Exception):
@@ -43,22 +58,25 @@ class Fatal(Exception):
 
 def load_config():
     c = json.loads(CONFIG.read_text())
-    for k in ("repo", "app_id", "installation_id", "app_slug", "private_key", "allowed_path_regex", "claude_edit_globs"):
+    for k in ("repo", "app_id", "installation_id", "app_slug", "allowed_path_regex", "claude_edit_globs"):
         if k not in c:
             raise Fatal(f"config missing {k}")
-    c.setdefault("reviewer", {"app_id": 1144995, "slug": "chatgpt-codex-connector", "owner": "openai"})
+    if c["repo"] != SANDBOX:
+        raise Fatal(f"this pilot runs only on {SANDBOX}")
+    c.setdefault("private_key", "/etc/agentloop/app.pem")
+    c.setdefault("claude_token_file", "/etc/agentloop/claude-token")
+    c.setdefault("claude_bin", "/opt/agentloop/bin/claude")
     c.setdefault("max_files", 20)
     c.setdefault("max_changes", 200)
     c.setdefault("max_rounds", 3)
     c.setdefault("test_mode", False)
     c.setdefault("dry_run", False)
-    state = Path(c.get("state_dir", "~/.local/state/agentloop")).expanduser()
-    c["state_dir"] = state
-    c["workdir"] = state / "work"
-    c["private_key"] = str(Path(c["private_key"]).expanduser())
+    c["max_runs_per_day"] = min(int(c.get("max_runs_per_day", MAX_RUNS_PER_DAY)), MAX_RUNS_PER_DAY)
+    c["state_dir"] = Path(c.get("state_dir", "/var/lib/agentloop"))
+    c["log_dir"] = Path(c.get("log_dir", "/var/log/agentloop"))
+    c["inbox"] = Path(c.get("inbox", "/var/lib/agentloop-inbox"))
+    c["workdir"] = c["state_dir"] / "work"
     c["allowed_re"] = re.compile(c["allowed_path_regex"])
-    if c["test_mode"] and c["repo"] != SANDBOX:
-        raise Fatal("test_mode is allowed only on the sandbox repository")
     return c
 
 
@@ -66,12 +84,16 @@ def log(c, event, **kw):
     rec = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event, **kw}
     line = json.dumps(rec, ensure_ascii=False)
     print(line, flush=True)
-    c["state_dir"].mkdir(parents=True, exist_ok=True)
-    with open(c["state_dir"] / "log.jsonl", "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    if os.geteuid() == 0:
+        return                                                 # mint stage: journal only, no root-owned files
+    try:
+        with open(c["log_dir"] / "log.jsonl", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass                                                   # the journal still has it
 
 
-# ── GitHub auth ──────────────────────────────────────────────────────────────
+# ── GitHub API ───────────────────────────────────────────────────────────────
 def b64url(b):
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
@@ -86,10 +108,10 @@ def app_jwt(c):
     return f"{head}.{body}.{b64url(sig)}"
 
 
-def api(method, path, token, data=None, scheme="Bearer"):
+def api(method, path, token, data=None):
     url = path if path.startswith("https://") else "https://api.github.com" + path
     req = urllib.request.Request(url, method=method, data=None if data is None else json.dumps(data).encode(),
-                                 headers={"Authorization": f"{scheme} {token}", "Accept": "application/vnd.github+json",
+                                 headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                                           "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "agentloop"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -123,8 +145,19 @@ def api_all(path, token):
     raise Fatal("pagination limit reached")
 
 
-def identity(c):
-    """Mint a one-repo token and prove the identity is the restricted App."""
+# ── stage 1: mint (root, ExecStartPre=+) ─────────────────────────────────────
+def write_handoff(path, text, uid, gid):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chown(path, uid, gid)
+
+
+def cmd_mint(c, command):
+    """Prove the App identity and hand a one-repo token to the unprivileged stage."""
+    st = RUNTIME.stat()
+    if os.geteuid() != 0 or st.st_uid == 0:
+        raise Fatal("mint must run as root into the unit's runtime directory")
     jwt = app_jwt(c)
     _, app, _ = api("GET", "/app", jwt)
     if not app or app.get("slug") != c["app_slug"] or app.get("id") != c["app_id"]:
@@ -132,24 +165,58 @@ def identity(c):
     extra = sorted(k for k, v in app.get("permissions", {}).items()
                    if k not in ALLOWED_APP_PERMS or (v == "write" and ALLOWED_APP_PERMS[k] == "read"))
     if extra:
-        raise Fatal(f"App has permissions beyond contents/pull_requests/issues: {sorted(extra)}")
+        raise Fatal(f"App has permissions beyond contents/pull_requests/issues: {extra}")
     inst = api_ok("GET", f"/app/installations/{c['installation_id']}", jwt)[0]
-    if inst.get("repository_selection") != "selected" or inst["account"]["login"] != c["repo"].split("/")[0]:
-        raise Fatal("App installation must be on the repo owner with 'Only select repositories'")
-    st, tok, _ = api("POST", f"/app/installations/{c['installation_id']}/access_tokens", jwt, {"permissions": TOKEN_PERMS})
-    if st != 201:
-        raise Fatal(f"token mint failed: HTTP {st} {(tok or {}).get('message')}")
+    if inst.get("repository_selection") != "selected" or inst["account"]["login"] != OWNER_LOGIN:
+        raise Fatal("App installation must be on the owner with 'Only select repositories'")
+    name = c["repo"].split("/")[1]
+    st_, tok, _ = api("POST", f"/app/installations/{c['installation_id']}/access_tokens", jwt,
+                      {"repositories": [name], "permissions": TOKEN_PERMS})
+    if st_ != 201:
+        raise Fatal(f"token mint failed: HTTP {st_} {(tok or {}).get('message')}")
     if tok.get("permissions") != {**TOKEN_PERMS, "metadata": "read"}:
         raise Fatal(f"token permissions unexpected: {tok.get('permissions')}")
-    token = tok["token"]
+    # Negative probe: the installation must not be able to mint for another repository.
+    st_other, other, _ = api("POST", f"/app/installations/{c['installation_id']}/access_tokens", jwt,
+                             {"repositories": ["jahongirnewapp"]})
+    if st_other == 201:
+        api("DELETE", "/installation/token", other["token"])
+        raise Fatal("installation can mint a token for jahongirnewapp")
+    ident = {"app_slug": app["slug"], "app_id": app["id"], "app_perms": app.get("permissions"),
+             "token_perms": tok.get("permissions"), "expires": tok.get("expires_at"),
+             "other_repo_mint_status": st_other}
+    write_handoff(RUNTIME / "gh-token", tok["token"], st.st_uid, st.st_gid)
+    write_handoff(RUNTIME / "identity.json", json.dumps(ident), st.st_uid, st.st_gid)
+    if command in ("run", "start"):
+        tf = Path(c["claude_token_file"])
+        if tf.exists():
+            write_handoff(RUNTIME / "claude-token", tf.read_text().strip(), st.st_uid, st.st_gid)
+    return 0
+
+
+# ── stage 2: unprivileged ────────────────────────────────────────────────────
+def take(path):
+    """Read a handoff file into memory and delete it."""
+    try:
+        text = path.read_text().strip()
+    except FileNotFoundError:
+        return None
+    path.unlink()
+    return text
+
+
+def identity(c):
+    token = take(RUNTIME / "gh-token")
+    info = json.loads(take(RUNTIME / "identity.json") or "{}")
+    if not token:
+        raise Fatal("no App token handed over (mint stage did not run)")
     repos, _ = api_ok("GET", "/installation/repositories", token)
     names = [r["full_name"] for r in repos["repositories"]]
     if names != [c["repo"]]:
-        raise Fatal(f"App installation reaches repositories other than {c['repo']}: {names}")
+        raise Fatal(f"token reaches repositories other than {c['repo']}: {names}")
     bot_login = f"{c['app_slug']}[bot]"
     bot, _ = api_ok("GET", f"/users/{urllib.request.quote(bot_login)}", token)
-    return {"token": token, "bot_login": bot_login, "bot_id": bot["id"], "app_perms": app.get("permissions"),
-            "repos": names, "expires": tok.get("expires_at")}
+    return {**info, "token": token, "bot_login": bot_login, "bot_id": bot["id"], "repos": names}
 
 
 # ── git (as the App) ─────────────────────────────────────────────────────────
@@ -157,12 +224,12 @@ CRED_HELPER = '!f(){ echo username=x-access-token; echo "password=$AGENTLOOP_GIT
 
 
 def git(c, ident, *args, check=True, cwd=None):
-    env = {k: os.environ[k] for k in SAFE_ENV if k in os.environ}
-    env.update({"AGENTLOOP_GIT_TOKEN": ident["token"], "GIT_TERMINAL_PROMPT": "0",
-                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
-                "GIT_AUTHOR_NAME": ident["bot_login"], "GIT_COMMITTER_NAME": ident["bot_login"],
-                "GIT_AUTHOR_EMAIL": f"{ident['bot_id']}+{ident['bot_login']}@users.noreply.github.com",
-                "GIT_COMMITTER_EMAIL": f"{ident['bot_id']}+{ident['bot_login']}@users.noreply.github.com"})
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(c["state_dir"]), "LANG": "C.UTF-8",
+           "AGENTLOOP_GIT_TOKEN": ident["token"], "GIT_TERMINAL_PROMPT": "0",
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_AUTHOR_NAME": ident["bot_login"], "GIT_COMMITTER_NAME": ident["bot_login"],
+           "GIT_AUTHOR_EMAIL": f"{ident['bot_id']}+{ident['bot_login']}@users.noreply.github.com",
+           "GIT_COMMITTER_EMAIL": f"{ident['bot_id']}+{ident['bot_login']}@users.noreply.github.com"}
     cmd = ["git", "-c", "credential.helper=", "-c", f"credential.helper={CRED_HELPER}",
            "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", *args]
     r = subprocess.run(cmd, cwd=cwd or c["workdir"] / "repo", env=env, capture_output=True, text=True, timeout=120)
@@ -185,8 +252,44 @@ def prepare_clone(c, ident, branch, sha=None):
     return head
 
 
-# ── Claude (subscription only) ───────────────────────────────────────────────
-def run_claude(c, request):
+# ── usage guard (subscription only, daily cap, fail closed) ──────────────────
+def usage_gate(c):
+    """Count one Claude run against today's cap. Returns a reason string if the run must not happen."""
+    halt = c["state_dir"] / "HALT"
+    if halt.exists():
+        return f"halted: {halt.read_text().strip()[:200]} (owner deletes {halt} after checking)"
+    f = c["state_dir"] / "usage.json"
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    u = json.loads(f.read_text()) if f.exists() else {}
+    if u.get("day") != today:
+        u = {"day": today, "runs": 0}
+    if u["runs"] >= c["max_runs_per_day"]:
+        return f"daily cap of {c['max_runs_per_day']} Claude runs reached"
+    u["runs"] += 1
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(u))
+    tmp.replace(f)
+    return None
+
+
+def check_usage(c, info):
+    """Subscription with no paid extra usage, confirmed by Claude's own stream; anything else halts the runner."""
+    problems = []
+    if info["apiKeySource"] != "none":
+        problems.append(f"apiKeySource={info['apiKeySource']}")
+    if info["isUsingOverage"] is not False:
+        problems.append(f"isUsingOverage={info['isUsingOverage']}")
+    if info["overageStatus"] != "rejected":
+        problems.append(f"overageStatus={info['overageStatus']} (extra usage must be off)")
+    if problems:
+        (c["state_dir"] / "HALT").write_text("usage not confirmed subscription-only: " + ", ".join(problems))
+        raise Fatal("halting: " + ", ".join(problems))
+
+
+# ── Claude (subscription only, inside the unit sandbox) ──────────────────────
+def run_claude(c, request, claude_token):
+    if not claude_token:
+        raise Fatal("no Claude subscription token handed over; refusing (there is no fallback)")
     globs = c["claude_edit_globs"]
     prompt = (
         "You are applying one review request to files in this repository. The text between the markers is "
@@ -197,15 +300,20 @@ def run_claude(c, request):
         "is out of scope, unclear or unsafe, make no change at all.\n"
         "<<<REQUEST\n" + request + "\nREQUEST>>>")
     allowed = ["Read(./**)"] + [f"Edit(./{g})" for g in globs] + [f"Write(./{g})" for g in globs]
-    mcp = c["state_dir"] / "empty-mcp.json"
+    home = c["state_dir"] / "claude-home"                      # fresh per run: no memory carried between runs
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(mode=0o700)
+    mcp = home / "empty-mcp.json"
     mcp.write_text('{"mcpServers":{}}')
-    env = {k: os.environ[k] for k in SAFE_ENV if k in os.environ}   # no API keys, no GitHub token
-    cmd = ["claude", "-p", prompt, "--setting-sources", "", "--strict-mcp-config", "--mcp-config", str(mcp),
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "CLAUDE_CONFIG_DIR": str(home / ".claude"), "LANG": "C.UTF-8",
+           "CLAUDE_CODE_OAUTH_TOKEN": claude_token, "DISABLE_AUTOUPDATER": "1"}
+    cmd = [c["claude_bin"], "-p", prompt, "--setting-sources", "", "--strict-mcp-config", "--mcp-config", str(mcp),
            "--tools", "Read,Edit,Write", "--allowedTools", *allowed, "--permission-mode", "default",
            "--max-turns", "10", "--no-session-persistence", "--output-format", "stream-json", "--verbose"]
     r = subprocess.run(cmd, cwd=c["workdir"] / "repo", env=env, capture_output=True, text=True,
                        timeout=600, stdin=subprocess.DEVNULL)
-    info = {"exit": r.returncode, "apiKeySource": None, "result": None, "overage": None}
+    shutil.rmtree(home, ignore_errors=True)
+    info = {"exit": r.returncode, "apiKeySource": None, "result": None, "isUsingOverage": None, "overageStatus": None}
     for line in r.stdout.splitlines():
         try:
             d = json.loads(line)
@@ -217,13 +325,25 @@ def run_claude(c, request):
             info["result"] = d.get("subtype")
             info["denials"] = len(d.get("permission_denials") or [])
         elif d.get("type") == "rate_limit_event":
-            rl = d.get("rate_limit_info") or d
-            info["overage"] = rl.get("isUsingOverage")
+            rl = d.get("rate_limit_info") or {}
+            info["isUsingOverage"] = rl.get("isUsingOverage")
+            info["overageStatus"] = rl.get("overageStatus")
     return info
 
 
+def claude_step(c, request, claude_token):
+    """Run Claude under the usage guard. Returns (info, reason-if-not-run)."""
+    why = usage_gate(c)
+    if why:
+        return None, why
+    info = run_claude(c, request, claude_token)
+    log(c, "claude", **info)
+    check_usage(c, info)
+    return info, None
+
+
 # ── diff validation (the wrapper decides, not the model) ─────────────────────
-def validate(c, ident):
+def validate(c, ident, secrets=()):
     st = git(c, ident, "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
     entries = [e for e in st.split("\0") if e]
     if not entries:
@@ -253,35 +373,51 @@ def validate(c, ident):
         total += int(a) + int(d)
     if total > c["max_changes"]:
         return None, f"too many changed lines: {total}"
+    added = "\n".join(l[1:] for l in git(c, ident, "diff", "--cached", "-U0").stdout.splitlines()
+                      if l.startswith("+") and not l.startswith("+++"))
+    if SECRET_PATTERNS.search(added) or any(s and s in added for s in secrets):
+        return None, "the change contains something that looks like a credential"
     return paths, None
 
 
-# ── PR helpers ───────────────────────────────────────────────────────────────
-def parse_review(body):
-    lines = (body or "").replace("\r", "").split("\n")
-    if not lines or lines[0].strip() != "AGENT-REVIEW v1":
+# ── review comments ──────────────────────────────────────────────────────────
+def parse_review(body, test_mode=False):
+    """Strict schema; anything else is None."""
+    if not body or len(body) > 6000:
         return None
-    fields, request = {}, None
-    for i, l in enumerate(lines[1:], 1):
-        if l.strip() == "Request:":
-            request = "\n".join(lines[i + 1:]).strip()
-            break
-        m = re.match(r"^(Commit|Verdict|Test):\s*(\S+)\s*$", l)
-        if m:
-            fields[m.group(1)] = m.group(2)
-    if not re.fullmatch(r"[0-9a-f]{40}", fields.get("Commit", "")) or fields.get("Verdict") not in ("FIX", "PASS"):
+    lines = body.replace("\r\n", "\n").split("\n")
+    if len(lines) < 4 or lines[0] != "AGENT-REVIEW v1":
         return None
-    return {**fields, "request": request or ""}
+    m1 = re.fullmatch(r"Commit: ([0-9a-f]{40})", lines[1])
+    m2 = re.fullmatch(r"Verdict: (FIX|PASS|ESCALATE)", lines[2])
+    if not (m1 and m2):
+        return None
+    i, simulated = 3, False
+    if test_mode and lines[3] == "Test: simulated":
+        i, simulated = 4, True
+    if len(lines) <= i or lines[i] != "Request:":
+        return None
+    request = "\n".join(lines[i + 1:]).strip()
+    if m2.group(1) in ("FIX", "ESCALATE") and not request:
+        return None
+    if len(request) > 4000:
+        return None
+    return {"Commit": m1.group(1), "Verdict": m2.group(1), "request": request, "simulated": simulated}
 
 
-def trusted_reviewer(c, comment, repo_owner):
-    app = comment.get("performed_via_github_app") or {}
-    r = c["reviewer"]
-    if app.get("id") == r["app_id"] and app.get("slug") == r["slug"] and (app.get("owner") or {}).get("login") == r["owner"]:
-        return True
-    # Sandbox-only simulation: owner-typed reviews that say "Test: simulated" (exercises failure paths).
-    return bool(c["test_mode"] and not app and comment["user"]["login"] == repo_owner
-                and re.search(r"^Test: simulated$", comment.get("body", ""), re.M))
+def trusted_reviewer(c, comment, review):
+    """The owner's account, via the pinned ChatGPT connector app, never edited.
+    In sandbox test mode only: owner-typed comments carrying 'Test: simulated' (no app)."""
+    user = comment.get("user") or {}
+    if user.get("id") != OWNER_ID or user.get("login") != OWNER_LOGIN or user.get("type") != "User":
+        return False
+    if not comment.get("created_at") or comment.get("created_at") != comment.get("updated_at"):
+        return False
+    app = comment.get("performed_via_github_app")
+    if app:
+        return (app.get("id") == REVIEWER_APP["id"] and app.get("slug") == REVIEWER_APP["slug"]
+                and (app.get("owner") or {}).get("login") == REVIEWER_APP["owner"] and not review["simulated"])
+    return bool(c["test_mode"] and review["simulated"])
 
 
 def reply(c, ident, pr, request_id, status, detail, sha=None):
@@ -302,18 +438,15 @@ def needs_owner(c, ident, pr, request_id, reason):
     log(c, "needs_owner", pr=pr, request=request_id, reason=reason)
 
 
-def apply_request(c, ident, branch, head_sha, request_id, round_no, request_text):
-    """Returns (sha, None) on success or (None, reason)."""
+def apply_request(c, ident, branch, head_sha, request_id, round_no, request_text, claude_token):
+    """Returns (sha, None) on success, (None, reason) for NEEDS_OWNER, or ("", reason) to retry later."""
     prepare_clone(c, ident, branch, head_sha)
-    info = run_claude(c, request_text)
-    log(c, "claude", **info)
-    if info["apiKeySource"] != "none":
-        raise Fatal(f"Claude did not run on the subscription login (apiKeySource={info['apiKeySource']})")
-    if info["overage"]:
-        raise Fatal("subscription is using paid overage; stopping")
+    info, why = claude_step(c, request_text, claude_token)
+    if why:
+        return "", why
     if info["exit"] != 0 or info["result"] != "success":
         return None, f"Claude run failed (exit {info['exit']}, {info['result']})"
-    paths, why = validate(c, ident)
+    paths, why = validate(c, ident, secrets=(ident["token"], claude_token))
     if why:
         return None, why
     msg = (f"docs(agent): apply review request {request_id}\n\nAgent-Request: {request_id}\n"
@@ -330,14 +463,19 @@ def apply_request(c, ident, branch, head_sha, request_id, round_no, request_text
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
+def stopped(c):
+    return (c["inbox"] / "STOP").exists()
+
+
 def cmd_run(c):
-    if Path("~/.config/agentloop/STOP").expanduser().exists():
+    if stopped(c):
         log(c, "stopped", reason="STOP file present")
         return 0
     ident = identity(c)
+    claude_token = take(RUNTIME / "claude-token")
     tok = ident["token"]
-    repo_owner = c["repo"].split("/")[0]
     meta, _ = api_ok("GET", f"/repos/{c['repo']}", tok)
+    ignored = 0
     for pr in api_all(f"/repos/{c['repo']}/pulls?state=open", tok):
         n, head, branch = pr["number"], pr["head"]["sha"], pr["head"]["ref"]
         if not branch.startswith("agent/") or (pr["head"].get("repo") or {}).get("full_name") != c["repo"] \
@@ -348,21 +486,30 @@ def cmd_run(c):
         comments = api_all(f"/repos/{c['repo']}/issues/{n}/comments", tok)
         handled = set()
         for cm in comments:
-            if cm["user"]["login"] == ident["bot_login"]:
+            if cm["user"]["login"] == ident["bot_login"] and cm["body"].startswith("AGENT-REPLY v1"):
                 m = re.search(r"^Request: (\d+)$", cm["body"], re.M)
-                if m and cm["body"].startswith("AGENT-REPLY v1"):
+                if m:
                     handled.add(m.group(1))
         commits = api_all(f"/repos/{c['repo']}/pulls/{n}/commits", tok)
         applied = set(re.findall(r"^Agent-Request: (\d+)$", "\n".join(x["commit"]["message"] for x in commits), re.M))
         handled |= applied
-        reviews = [(cm, parse_review(cm["body"])) for cm in comments if trusted_reviewer(c, cm, repo_owner)]
-        reviews = [(cm, r) for cm, r in reviews if r]
+        reviews = []
+        for cm in comments:
+            if cm["body"].startswith("AGENT-REVIEW"):
+                rv = parse_review(cm["body"], c["test_mode"])
+                if rv and trusted_reviewer(c, cm, rv):
+                    reviews.append((cm, rv))
+                else:
+                    ignored += 1
         if not reviews:
             continue
         cm, rv = max(reviews, key=lambda x: (x[0]["created_at"], x[0]["id"]))    # only the latest review counts
         rid = str(cm["id"])
         if rv["Verdict"] == "PASS" or rid in handled:
             continue
+        if rv["Verdict"] == "ESCALATE":                           # safety first: honoured on any commit
+            needs_owner(c, ident, n, rid, "the reviewer escalated this PR to the owner")
+            return 0
         if rv["Commit"] != head:
             log(c, "stale_review", pr=n, request=rid, review_commit=rv["Commit"][:12], head=head[:12])
             continue
@@ -370,30 +517,45 @@ def cmd_run(c):
             needs_owner(c, ident, n, rid, f"round limit of {c['max_rounds']} applied corrections reached")
             return 0
         log(c, "applying", pr=n, request=rid, round=len(applied) + 1, head=head[:12])
-        sha, why = apply_request(c, ident, branch, head, rid, len(applied) + 1, rv["request"])
-        if why:
+        sha, why = apply_request(c, ident, branch, head, rid, len(applied) + 1, rv["request"], claude_token)
+        if sha == "":
+            log(c, "deferred", pr=n, request=rid, reason=why)
+        elif why:
             needs_owner(c, ident, n, rid, why)
         else:
             reply(c, ident, n, rid, "APPLIED", "Applied the requested change; the scope check and a re-review "
                   "will run on the new head.", sha)
             log(c, "applied", pr=n, request=rid, sha=sha)
         return 0                                                                # at most one request per run
-    log(c, "idle")
+    log(c, "idle", ignored_review_comments=ignored)
     return 0
 
 
-def cmd_start(c, branch, title, request_file):
+def cmd_start(c):
+    if stopped(c):
+        log(c, "stopped", reason="STOP file present")
+        return 0
+    raw = (c["inbox"] / "start.json").read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    done_file = c["state_dir"] / "started.json"
+    done = json.loads(done_file.read_text()) if done_file.exists() else []
+    if digest in done:
+        log(c, "already_started", digest=digest[:12])
+        return 0
+    job = json.loads(raw)
+    branch, title, request = job["branch"], job["title"], job["request"]
     if not re.fullmatch(r"agent/[a-z0-9][a-z0-9._-]{0,60}", branch):
         raise Fatal("branch must be agent/<lowercase-name>")
     ident = identity(c)
+    claude_token = take(RUNTIME / "claude-token")
     meta, _ = api_ok("GET", f"/repos/{c['repo']}", ident["token"])
     base = prepare_clone(c, ident, meta["default_branch"])
-    request = Path(request_file).read_text()
-    info = run_claude(c, request)
-    log(c, "claude", **info)
-    if info["apiKeySource"] != "none" or info["overage"] or info["exit"] != 0 or info["result"] != "success":
+    info, why = claude_step(c, request, claude_token)
+    if why:
+        raise Fatal(why)
+    if info["exit"] != 0 or info["result"] != "success":
         raise Fatal(f"Claude run not acceptable: {info}")
-    paths, why = validate(c, ident)
+    paths, why = validate(c, ident, secrets=(ident["token"], claude_token))
     if why:
         raise Fatal(why)
     git(c, ident, "commit", "-q", "-m", f"docs(agent): {title}\n\nAgent-Start: owner request\nAgent-Base: {base}\n")
@@ -401,6 +563,7 @@ def cmd_start(c, branch, title, request_file):
     pr, _ = api_ok("POST", f"/repos/{c['repo']}/pulls", ident["token"],
                    {"title": title, "head": branch, "base": meta["default_branch"],
                     "body": f"Opened by agentloop as `{ident['bot_login']}`. Files: {', '.join(paths)}.\n\nThe owner merges; the agent never does."})
+    done_file.write_text(json.dumps(done + [digest]))
     log(c, "started", pr=pr["number"], branch=branch, url=pr["html_url"])
     return 0
 
@@ -412,28 +575,56 @@ def cmd_whoami(c):
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("run", "start", "whoami"):
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS + ("mint",):
         print(__doc__)
         return 2
-    c = load_config()
-    lock = open(c["state_dir"].mkdir(parents=True, exist_ok=True) or c["state_dir"] / "lock", "w")
+    if "isolation" in sys.argv[1:3]:                          # needs no App configuration or credentials
+        c = {"log_dir": Path("/var/log/agentloop"), "state_dir": Path("/var/lib/agentloop")}
+        if sys.argv[1] == "mint":
+            return 0
+    else:
+        c = load_config()
+    if sys.argv[1] == "mint":
+        try:
+            return cmd_mint(c, sys.argv[2] if len(sys.argv) > 2 else "")
+        except Fatal as e:
+            log(c, "fatal", stage="mint", error=str(e))
+            return 1
+    if os.geteuid() == 0:
+        print("refusing to run as root", file=sys.stderr)
+        return 1
+    lock = open(c["state_dir"] / "lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         log(c, "busy", reason="another run holds the lock")
         return 0
     try:
-        if sys.argv[1] == "run":
+        cmd = sys.argv[1]
+        if cmd == "run":
             return cmd_run(c)
-        if sys.argv[1] == "whoami":
+        if cmd == "start":
+            return cmd_start(c)
+        if cmd == "whoami":
             return cmd_whoami(c)
-        return cmd_start(c, *sys.argv[2:5])
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        if cmd == "selftest":
+            import selftest
+            return selftest.main(c)
+        import isolation
+        return isolation.main(c)
     except Fatal as e:
         log(c, "fatal", error=str(e))
         return 1
     except Exception as e:  # fail closed, no raw data
         log(c, "error", error=type(e).__name__)
         return 1
+    finally:
+        for f in ("gh-token", "claude-token", "identity.json"):
+            try:
+                (RUNTIME / f).unlink()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
