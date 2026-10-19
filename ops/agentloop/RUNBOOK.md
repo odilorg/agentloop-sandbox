@@ -91,6 +91,9 @@ never removes it; it still counts against the daily cap. It logs only fixed fiel
 `is_error`, result subtype, CLI version, event-type counts, usage fields and a diagnostic
 category (`oauth_expired`, `oauth_invalid`, `oauth_scope`, `http_401/403/429`, `credits`,
 `fs_eacces`, `unsupported_flag`, `network`, `unknown`). Raw output, prompts and tokens are never logged.
+Structured fields are bounded too: the CLI version must match a version pattern, and `apiKeySource`, the
+result subtype, `overageStatus` and event names must be on fixed allowlists. Anything else is logged as
+`unknown`/`other` and fails the success or subscription check; it is never treated as a passing value.
 
 ```
 echo 'run one agentloop diagnostic probe' > /var/lib/agentloop-inbox/probe-request

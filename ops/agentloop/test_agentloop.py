@@ -380,6 +380,44 @@ class Diagnostics(unittest.TestCase):
         self.assertIn("oauth_invalid", why)
         self.assertEqual(calls, [])                                         # no validate, commit, push or API write
 
+    def poisoned_streams(self):
+        """One stream per structured field, each carrying a fake token where a fixed value belongs."""
+        yield "claude_code_version", [{**INIT, "claude_code_version": FAKE_TOKEN}, RATE_OK, GOOD]
+        yield "apiKeySource", [{**INIT, "apiKeySource": FAKE_TOKEN}, RATE_OK, GOOD]
+        yield "result.subtype", [INIT, RATE_OK, {**GOOD, "subtype": FAKE_TOKEN}]
+        yield "result.is_error", [INIT, RATE_OK, {**GOOD, "is_error": FAKE_TOKEN}]
+        yield "isUsingOverage", [INIT, {"type": "rate_limit_event",
+                                        "rate_limit_info": {"isUsingOverage": FAKE_TOKEN, "overageStatus": "rejected"}}, GOOD]
+        yield "overageStatus", [INIT, {"type": "rate_limit_event",
+                                       "rate_limit_info": {"isUsingOverage": False, "overageStatus": FAKE_TOKEN}}, GOOD]
+
+    def test_structured_fields_bounded_and_fail_closed(self):
+        for field, stream in self.poisoned_streams():
+            with self.subTest(field=field):
+                self.tearDown_state()
+                self.c["claude_bin"], _ = fake_claude(self.tmp, stream)
+                info = al.run_claude(self.c, "req", FAKE_TOKEN)
+                self.assert_clean(json.dumps(info))
+                self.assertTrue(al.run_failed(info) or al.usage_problems(info), field)   # never coerced to passing
+                self.assertIn("unknown", json.dumps(info))
+                result, text = self.logged(al.claude_step, self.c, "req", FAKE_TOKEN)
+                halt = self.c["state_dir"] / "HALT"
+                self.assert_clean(text + (halt.read_text() if halt.exists() else "") + str(result))
+
+    def test_event_names_bounded(self):
+        self.c["claude_bin"], _ = fake_claude(self.tmp, [INIT, RATE_OK, {"type": FAKE_TOKEN.lower(), "subtype": FAKE_TOKEN},
+                                                         {"type": "system", "subtype": FAKE_TOKEN.lower()}, GOOD])
+        info = al.run_claude(self.c, "req", FAKE_TOKEN)
+        self.assertEqual(info["events"], {"system:init": 1, "rate_limit_event": 1, "other:other": 1,
+                                          "system:other": 1, "result:success": 1})
+        self.assert_clean(json.dumps(info))
+        self.assertNotIn("qqqq", json.dumps(info).lower())
+
+    def tearDown_state(self):
+        for name in ("HALT", "usage.json", "log.jsonl"):
+            for d in (self.c["state_dir"], self.c["log_dir"]):
+                (d / name).unlink(missing_ok=True)
+
     def test_classify(self):
         cases = {"Invalid bearer token": "oauth_invalid", "OAuth token has expired": "oauth_expired",
                  "HTTP 403 Forbidden": "http_403", "429 Too Many Requests": "http_429",
@@ -444,6 +482,16 @@ class Probe(unittest.TestCase):
             self.assertNotIn(leak, text)
         self.assertEqual((self.c["state_dir"] / "HALT").read_text(), "phase 2 halt")
         self.assertTrue((self.c["state_dir"] / "probe-done").exists())      # a failed probe still counts
+
+    def test_poisoned_fields_fail_closed_without_leaks(self):
+        for field, stream in Diagnostics.poisoned_streams(None):
+            with self.subTest(field=field):
+                (self.c["state_dir"] / "probe-done").unlink(missing_ok=True)
+                rc, text = self.run_probe(stream)
+                self.assertEqual(rc, 1, field)
+                for leak in (FAKE_TOKEN, "sk-ant-", "QQQQ"):
+                    self.assertNotIn(leak, text + (self.c["state_dir"] / "HALT").read_text())
+                self.assertEqual((self.c["state_dir"] / "HALT").read_text(), "phase 2 halt")
 
     def test_counts_against_cap(self):
         (self.c["state_dir"] / "usage.json").write_text(json.dumps(

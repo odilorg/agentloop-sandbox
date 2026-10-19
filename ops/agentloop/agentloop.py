@@ -303,8 +303,10 @@ def check_usage(c, info):
 
 
 def run_failed(info):
-    """Any sign of failure rejects the output, whatever the subtype says (subtype=success + is_error=true + exit 1 happens)."""
-    return info["exit"] != 0 or info["is_error"] is not False or info["result"] != "success"
+    """Any sign of failure rejects the output, whatever the subtype says (subtype=success + is_error=true + exit 1 happens).
+    An unparseable CLI version means an unexpected stream, so it fails closed too."""
+    return (info["exit"] != 0 or info["is_error"] is not False or info["result"] != "success"
+            or info.get("cli_version") == "unknown")
 
 
 # Fixed patterns, applied in memory to Claude's result text and stderr. Only the category NAMES are logged.
@@ -329,10 +331,49 @@ def classify(*texts):
     return cats or (["unknown"] if blob.strip() else ["no_error_text"])
 
 
+# Structured stream fields are untrusted too: only these fixed values are ever logged. Anything else becomes
+# "unknown", which fails the subscription and success checks (never coerced to a passing value).
+API_KEY_SOURCES = {"none", "user", "project", "org", "temporary", "ANTHROPIC_API_KEY", "apiKeyHelper",
+                   "/login managed key"}
+RESULT_SUBTYPES = {"success", "error_max_turns", "error_during_execution", "error_max_budget_usd",
+                   "error_max_structured_output_retries"}
+OVERAGE_STATUSES = {"allowed", "allowed_warning", "rejected"}
+EVENT_TYPES = {"system", "assistant", "user", "result", "rate_limit_event", "stream_event"}
+EVENT_SUBTYPES = {"init", "status", "compact_boundary", "api_retry", "hook_started", "hook_response"} | RESULT_SUBTYPES
+VERSION_RE = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,6}")
+
+
+def pick(value, allowed):
+    """None stays None (field absent); an allowlisted string passes; anything else is "unknown"."""
+    if value is None:
+        return None
+    return value if isinstance(value, str) and value in allowed else "unknown"
+
+
+def flag(value):
+    return value if value is None or isinstance(value, bool) else "unknown"
+
+
+def safe_version(value):
+    if value is None:
+        return None
+    return value if isinstance(value, str) and VERSION_RE.fullmatch(value) else "unknown"
+
+
+def event_kind(d):
+    t, sub = d.get("type"), d.get("subtype")
+    kind = t if isinstance(t, str) and t in EVENT_TYPES else "other"
+    if sub is not None:
+        kind += ":" + (sub if isinstance(sub, str) and sub in EVENT_SUBTYPES else "other")
+    return kind
+
+
 def parse_stream(stdout, stderr, returncode):
-    """Reduce Claude's output to fixed, non-sensitive fields. Raw stdout/stderr and result text never leave here."""
-    info = {"exit": returncode, "cli_version": None, "apiKeySource": None, "result": None, "is_error": None,
-            "isUsingOverage": None, "overageStatus": None, "denials": None, "events": {}}
+    """Reduce Claude's output to fixed, non-sensitive fields. Raw stdout/stderr, result text and any
+    unexpected structured value never leave here."""
+    info = {"exit": returncode if isinstance(returncode, int) else "unknown", "cli_version": None,
+            "apiKeySource": None, "result": None, "is_error": None, "isUsingOverage": None, "overageStatus": None,
+            "denials": None, "events": {}}
     error_texts = [stderr]
     for line in stdout.splitlines():
         try:
@@ -343,21 +384,22 @@ def parse_stream(stdout, stderr, returncode):
             continue
         if not isinstance(d, dict):
             continue
-        kind = re.sub(r"[^a-z_:]", "?", (str(d.get("type")) + (f":{d.get('subtype')}" if d.get("subtype") else ""))[:48])
+        kind = event_kind(d)
         info["events"][kind] = info["events"].get(kind, 0) + 1
         if d.get("type") == "system" and d.get("subtype") == "init":
-            info["apiKeySource"] = d.get("apiKeySource")
-            info["cli_version"] = d.get("claude_code_version")
+            info["apiKeySource"] = pick(d.get("apiKeySource"), API_KEY_SOURCES) or "unknown"
+            info["cli_version"] = safe_version(d.get("claude_code_version"))
         elif d.get("type") == "result":
-            info["result"] = d.get("subtype")
-            info["is_error"] = d.get("is_error")
-            info["denials"] = len(d.get("permission_denials") or [])
+            info["result"] = pick(d.get("subtype"), RESULT_SUBTYPES) or "unknown"
+            info["is_error"] = flag(d.get("is_error"))
+            denials = d.get("permission_denials")
+            info["denials"] = len(denials) if isinstance(denials, list) else (0 if denials is None else "unknown")
             error_texts.append(str(d.get("result") or ""))
             error_texts.extend(str(e) for e in (d.get("errors") or []))
         elif d.get("type") == "rate_limit_event":
-            rl = d.get("rate_limit_info") or {}
-            info["isUsingOverage"] = rl.get("isUsingOverage")
-            info["overageStatus"] = rl.get("overageStatus")
+            rl = d.get("rate_limit_info") if isinstance(d.get("rate_limit_info"), dict) else {}
+            info["isUsingOverage"] = flag(rl.get("isUsingOverage"))
+            info["overageStatus"] = pick(rl.get("overageStatus"), OVERAGE_STATUSES)
         elif d.get("type") == "assistant" and d.get("error"):
             error_texts.append(str(d.get("error")))
     info["diagnostic"] = classify(*error_texts) if run_failed(info) else ["none"]
@@ -383,8 +425,8 @@ def cli_version(c, home, claude_token):
     try:
         r = subprocess.run([c["claude_bin"], "--version"], env=claude_env(c, home, claude_token), capture_output=True,
                            text=True, timeout=30, stdin=subprocess.DEVNULL)
-        m = re.match(r"\s*(\d+\.\d+\.\d+)", r.stdout)
-        return m.group(1) if m else None
+        m = re.match(r"\s*(\d{1,4}\.\d{1,4}\.\d{1,6})(?!\S)", r.stdout)
+        return m.group(1) if m else "unknown"
     except Exception:
         return None
 
