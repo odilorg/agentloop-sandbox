@@ -343,6 +343,38 @@ EVENT_SUBTYPES = {"init", "status", "compact_boundary", "api_retry", "hook_start
 VERSION_RE = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,6}")
 
 
+# Claude's structured API error fields: system/api_retry `error_status` and `error`, assistant `error`, result
+# `api_error_status`. Only an HTTP status in 400-599 or one of these exact category names is ever logged; the
+# markers are "absent" (field missing), "null" and "unknown" (anything else). Diagnostic only: they gate nothing.
+API_ERROR_CATEGORIES = {"authentication_failed", "oauth_org_not_allowed", "billing_error", "rate_limit", "overloaded",
+                        "invalid_request", "model_not_found", "server_error", "max_output_tokens", "unknown"}
+MAX_DISTINCT = 8
+
+
+def http_status(d, key):
+    if key not in d:
+        return "absent"
+    v = d[key]
+    if v is None:
+        return "null"
+    return v if type(v) is int and 400 <= v <= 599 else "unknown"         # type() is int: a bool is not a status
+
+
+def error_category(d, key):
+    if key not in d:
+        return "absent"
+    v = d[key]
+    if v is None:
+        return "null"
+    return v if isinstance(v, str) and v in API_ERROR_CATEGORIES else "unknown"
+
+
+def tally(counts, value):
+    """Count a fixed marker, status or category; past MAX_DISTINCT keys, further values fold into "other"."""
+    key = str(value) if str(value) in counts or len(counts) < MAX_DISTINCT else "other"
+    counts[key] = counts.get(key, 0) + 1
+
+
 def pick(value, allowed):
     """None stays None (field absent); an allowlisted string passes; anything else is "unknown"."""
     if value is None:
@@ -373,7 +405,8 @@ def parse_stream(stdout, stderr, returncode):
     unexpected structured value never leave here."""
     info = {"exit": returncode if isinstance(returncode, int) else "unknown", "cli_version": None,
             "apiKeySource": None, "result": None, "is_error": None, "isUsingOverage": None, "overageStatus": None,
-            "denials": None, "events": {}}
+            "denials": None, "events": {}, "retry_status": {}, "retry_error": {}, "assistant_error": {},
+            "api_error_status": None}
     error_texts = [stderr]
     for line in stdout.splitlines():
         try:
@@ -386,7 +419,10 @@ def parse_stream(stdout, stderr, returncode):
             continue
         kind = event_kind(d)
         info["events"][kind] = info["events"].get(kind, 0) + 1
-        if d.get("type") == "system" and d.get("subtype") == "init":
+        if d.get("type") == "system" and d.get("subtype") == "api_retry":
+            tally(info["retry_status"], http_status(d, "error_status"))
+            tally(info["retry_error"], error_category(d, "error"))
+        elif d.get("type") == "system" and d.get("subtype") == "init":
             info["apiKeySource"] = pick(d.get("apiKeySource"), API_KEY_SOURCES) or "unknown"
             info["cli_version"] = safe_version(d.get("claude_code_version"))
         elif d.get("type") == "result":
@@ -394,14 +430,17 @@ def parse_stream(stdout, stderr, returncode):
             info["is_error"] = flag(d.get("is_error"))
             denials = d.get("permission_denials")
             info["denials"] = len(denials) if isinstance(denials, list) else (0 if denials is None else "unknown")
+            info["api_error_status"] = http_status(d, "api_error_status")
             error_texts.append(str(d.get("result") or ""))
             error_texts.extend(str(e) for e in (d.get("errors") or []))
         elif d.get("type") == "rate_limit_event":
             rl = d.get("rate_limit_info") if isinstance(d.get("rate_limit_info"), dict) else {}
             info["isUsingOverage"] = flag(rl.get("isUsingOverage"))
             info["overageStatus"] = pick(rl.get("overageStatus"), OVERAGE_STATUSES)
-        elif d.get("type") == "assistant" and d.get("error"):
-            error_texts.append(str(d.get("error")))
+        elif d.get("type") == "assistant":
+            tally(info["assistant_error"], error_category(d, "error"))
+            if d.get("error"):
+                error_texts.append(str(d.get("error")))
     info["diagnostic"] = classify(*error_texts) if run_failed(info) else ["none"]
     return info
 

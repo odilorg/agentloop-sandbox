@@ -95,6 +95,12 @@ category (`oauth_expired`, `oauth_invalid`, `oauth_scope`, `http_401/403/429`, `
 Structured fields are bounded too: the CLI version must match a version pattern, and `apiKeySource`, the
 result subtype, `overageStatus` and event names must be on fixed allowlists. Anything else is logged as
 `unknown`/`other` and fails the success or subscription check; it is never treated as a passing value.
+Claude's structured API errors are counted the same way: `retry_status` / `retry_error` (each
+`system/api_retry` event's `error_status` and `error`), `assistant_error` and the result's `api_error_status`.
+A status is logged only as an integer 400–599, a category only by exact name (`authentication_failed`,
+`oauth_org_not_allowed`, `billing_error`, `rate_limit`, `overloaded`, `invalid_request`, `model_not_found`,
+`server_error`, `max_output_tokens`, `unknown`); otherwise `absent`, `null` or `unknown`. At most 8 distinct
+values per field (the rest count as `other`). These are diagnostic only and change no gate.
 
 ```
 echo 'run one agentloop diagnostic probe' > /var/lib/agentloop-inbox/probe-request

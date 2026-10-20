@@ -428,6 +428,119 @@ class Diagnostics(unittest.TestCase):
             self.assertIn(cat, al.classify(text), text)
 
 
+def retry(status="absent", error="absent"):
+    d = {"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 2, "retry_delay_ms": 500}
+    if status != "absent":
+        d["error_status"] = status
+    if error != "absent":
+        d["error"] = error
+    return d
+
+
+def assistant_error(error):
+    return {"type": "assistant", "message": {"content": [{"type": "text", "text": ERR_TEXT}]}, "error": error}
+
+
+class StructuredErrors(unittest.TestCase):
+    """api_retry / assistant / result error fields: an HTTP status 400-599 or an exact category name, else a marker."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.c = config(self.tmp, claude_edit_globs=["docs/pilot/**"])
+        (self.c["workdir"] / "repo").mkdir(parents=True)
+
+    def parse(self, stream, exit_code=0):
+        lines = [json.dumps(x) if isinstance(x, dict) else x for x in stream]
+        return al.parse_stream("\n".join(lines), "", exit_code)
+
+    def test_statuses_and_categories(self):
+        cases = [(401, "authentication_failed"), (403, "oauth_org_not_allowed"), (429, "rate_limit"),
+                 (500, "server_error"), (529, "overloaded")]
+        for status, category in cases:
+            with self.subTest(status=status):
+                info = self.parse([INIT, retry(status, category), retry(status, category), CONTRADICTORY], 1)
+                self.assertEqual(info["retry_status"], {str(status): 2})
+                self.assertEqual(info["retry_error"], {category: 2})
+
+    def test_every_listed_category_passes_exactly(self):
+        for category in sorted(al.API_ERROR_CATEGORIES):
+            info = self.parse([INIT, assistant_error(category), CONTRADICTORY], 1)
+            self.assertEqual(info["assistant_error"], {category: 1})
+        info = self.parse([INIT, assistant_error("Rate_Limit"), assistant_error("rate_limit "), CONTRADICTORY], 1)
+        self.assertEqual(info["assistant_error"], {"unknown": 2})              # exact match only
+
+    def test_markers_for_null_absent_and_unfamiliar(self):
+        info = self.parse([INIT, retry(None, None), retry(), retry(418, "teapot_error"), CONTRADICTORY], 1)
+        self.assertEqual(info["retry_status"], {"null": 1, "absent": 1, "418": 1})
+        self.assertEqual(info["retry_error"], {"null": 1, "absent": 1, "unknown": 1})
+        self.assertEqual(info["api_error_status"], "absent")                  # result without the field
+        self.assertIsNone(self.parse([INIT])["api_error_status"])             # no result event at all
+
+    def test_status_must_be_an_int_in_range(self):
+        for bad in (200, 399, 600, 99999, -401, True, 429.0, "429", [429], {"s": 429}):
+            with self.subTest(bad=bad):
+                info = self.parse([INIT, retry(bad, "rate_limit"), {**CONTRADICTORY, "api_error_status": bad}], 1)
+                self.assertEqual(info["retry_status"], {"unknown": 1})
+                self.assertEqual(info["api_error_status"], "unknown")
+        info = self.parse([INIT, {**CONTRADICTORY, "api_error_status": 401}], 1)
+        self.assertEqual(info["api_error_status"], 401)
+
+    def test_distinct_values_bounded(self):
+        info = self.parse([INIT] + [retry(400 + i, "server_error") for i in range(30)] + [CONTRADICTORY], 1)
+        self.assertLessEqual(len(info["retry_status"]), al.MAX_DISTINCT + 1)
+        self.assertEqual(sum(info["retry_status"].values()), 30)
+        self.assertEqual(info["retry_status"]["other"], 30 - al.MAX_DISTINCT)
+
+    def poisoned(self):
+        nested = {"x": FAKE_TOKEN, "y": [FAKE_TOKEN]}
+        for value in (FAKE_TOKEN, FAKE_TOKEN.lower(), nested, [FAKE_TOKEN], "Unauthorized " + FAKE_TOKEN):
+            yield [INIT, retry(value, value), retry(value, value), assistant_error(value),
+                   {**CONTRADICTORY, "api_error_status": value}]
+
+    def test_token_in_every_new_field_never_logged(self):
+        for stream in self.poisoned():
+            for name in ("HALT", "log.jsonl"):
+                for d in (self.c["state_dir"], self.c["log_dir"]):
+                    (d / name).unlink(missing_ok=True)
+            self.c["claude_bin"], _ = fake_claude(self.tmp, stream, stderr="", exit_code=1)
+            info = al.run_claude(self.c, "req", FAKE_TOKEN)
+            self.assertEqual(info["retry_status"], {"unknown": 2})
+            self.assertEqual(info["retry_error"], {"unknown": 2})
+            self.assertEqual(info["assistant_error"], {"unknown": 1})
+            self.assertEqual(info["api_error_status"], "unknown")
+            out = []
+            with mock.patch("builtins.print", lambda *x, **k: out.append(" ".join(map(str, x)))):
+                with self.assertRaises(al.Fatal) as e:
+                    al.claude_step(self.c, "req", FAKE_TOKEN)
+            text = "\n".join(out) + str(e.exception) + json.dumps(info)
+            for f in (self.c["state_dir"] / "HALT", self.c["log_dir"] / "log.jsonl"):
+                text += f.read_text() if f.exists() else ""
+            for leak in (FAKE_TOKEN, "sk-ant-", "QQQQ", "qqqq", "Unauthorized", "OAuth token has expired"):
+                self.assertNotIn(leak, text)
+
+    def test_real_probe_shape_contradictory_success(self):
+        # 20 Oct probe shape: two retries, an assistant error, result subtype=success with is_error=true, exit 1.
+        stream = [INIT, retry(529, "overloaded"), retry(529, "overloaded"), assistant_error("server_error"),
+                  {**CONTRADICTORY, "result": "API Error: something odd"}]
+        info = self.parse(stream, 1)
+        self.assertTrue(al.run_failed(info))
+        self.assertEqual((info["result"], info["is_error"], info["exit"]), ("success", True, 1))
+        self.assertEqual(info["retry_status"], {"529": 2})
+        self.assertEqual(info["retry_error"], {"overloaded": 2})
+        self.assertEqual(info["assistant_error"], {"server_error": 1})
+        self.assertEqual(info["events"], {"system:init": 1, "system:api_retry": 2, "assistant": 1, "result:success": 1})
+        self.assertTrue(al.usage_problems(info))                               # still no rate_limit_event: fails closed
+
+    def test_new_fields_never_change_the_gates(self):
+        clean = self.parse([INIT, RATE_OK, GOOD])
+        noisy = self.parse([INIT, retry(529, "overloaded"), assistant_error("server_error"), RATE_OK,
+                            {**GOOD, "api_error_status": 500}])
+        self.assertEqual(al.usage_problems(clean), al.usage_problems(noisy))
+        self.assertEqual(al.run_failed(clean), al.run_failed(noisy))
+        for field in ("apiKeySource", "isUsingOverage", "overageStatus", "result", "is_error", "exit"):
+            self.assertEqual(clean[field], noisy[field], field)
+
+
 class Probe(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -492,6 +605,21 @@ class Probe(unittest.TestCase):
                 for leak in (FAKE_TOKEN, "sk-ant-", "QQQQ"):
                     self.assertNotIn(leak, text + (self.c["state_dir"] / "HALT").read_text())
                 self.assertEqual((self.c["state_dir"] / "HALT").read_text(), "phase 2 halt")
+
+    def test_structured_error_fields_reported_without_leaks(self):
+        rc, text = self.run_probe([INIT, retry(529, "overloaded"), retry(FAKE_TOKEN, FAKE_TOKEN),
+                                   assistant_error(FAKE_TOKEN), {**CONTRADICTORY, "api_error_status": FAKE_TOKEN}],
+                                  exit_code=1)
+        self.assertEqual(rc, 1)
+        self.assertIn('"retry_status": {"529": 1, "unknown": 1}', text)
+        self.assertIn('"retry_error": {"overloaded": 1, "unknown": 1}', text)
+        self.assertIn('"assistant_error": {"unknown": 1}', text)
+        self.assertIn('"api_error_status": "unknown"', text)
+        log = self.c["log_dir"] / "log.jsonl"
+        everything = text + (log.read_text() if log.exists() else "") + (self.c["state_dir"] / "HALT").read_text()
+        for leak in (FAKE_TOKEN, "sk-ant-", "QQQQ", "Please obtain"):
+            self.assertNotIn(leak, everything)
+        self.assertEqual((self.c["state_dir"] / "HALT").read_text(), "phase 2 halt")
 
     def test_counts_against_cap(self):
         (self.c["state_dir"] / "usage.json").write_text(json.dumps(
