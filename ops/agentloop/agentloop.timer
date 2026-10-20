@@ -1,0 +1,11 @@
+[Unit]
+Description=agentloop run every 2 minutes (NOT enabled by install.sh)
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+Unit=agentloop@run.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target
